@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/ssh_mcp/__init__.py
+src/ssh_mcp/config.py
+src/ssh_mcp/log_config.py
+src/ssh_mcp/server.py
+src/ssh_mcp/session.py
+src/ssh_mcp/transcript.py
+src/ssh_mcp.egg-info/PKG-INFO
+src/ssh_mcp.egg-info/SOURCES.txt
+src/ssh_mcp.egg-info/dependency_links.txt
+src/ssh_mcp.egg-info/entry_points.txt
+src/ssh_mcp.egg-info/requires.txt
+src/ssh_mcp.egg-info/top_level.txt
+tests/test_core.py

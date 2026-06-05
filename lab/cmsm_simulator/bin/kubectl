@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+import os
+import subprocess
+import sys
+from typing import List, Optional
+
+
+NAMESPACES = ["default", "orders", "payments", "kube-system"]
+
+PODS = {
+    "orders": [
+        ("orders-api-7d9d65f8b4-2plxq", "Running", "orders-api"),
+        ("orders-worker-6b7f4d6db9-x9zrt", "Running", "orders-worker"),
+    ],
+    "payments": [
+        ("payments-api-6cc447f559-k8mvp", "Running", "payments-api"),
+        ("payments-worker-59cd87bf5f-vm2qs", "CrashLoopBackOff", "payments-worker"),
+    ],
+    "default": [
+        ("demo-shell-7789f879df-7kq4m", "Running", "demo-shell"),
+    ],
+}
+
+
+def main(argv):
+    if not argv or argv[0] in {"help", "--help", "-h"}:
+        print_help()
+        return 0
+
+    command = argv[0]
+    rest = argv[1:]
+    lab_home = get_lab_home()
+
+    if command == "get":
+        return handle_get(rest)
+    if command == "exec":
+        return handle_exec(lab_home, rest)
+    if command == "logs":
+        return handle_logs(lab_home, rest)
+
+    print(f"kubectl simulator: unsupported command: {command}", file=sys.stderr)
+    print_help()
+    return 2
+
+
+def get_lab_home():
+    raw_home = os.environ.get("SSH_MCP_LAB_HOME")
+    if raw_home:
+        return Path(raw_home).expanduser().resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+def handle_get(args):
+    resource = first_positional(args)
+    namespace = option_value(args, "-n", "--namespace") or "default"
+
+    if resource in {"ns", "namespace", "namespaces"}:
+        print("NAME          STATUS   AGE")
+        for namespace_name in NAMESPACES:
+            print(f"{namespace_name:<13} Active   42d")
+        return 0
+
+    if resource in {"pod", "pods", "po"}:
+        print("NAME                               READY   STATUS             RESTARTS   AGE")
+        for pod_name, status, _app in PODS.get(namespace, []):
+            ready = "0/1" if status == "CrashLoopBackOff" else "1/1"
+            restarts = "7" if status == "CrashLoopBackOff" else "0"
+            print(f"{pod_name:<34} {ready:<7} {status:<18} {restarts:<10} 3d")
+        return 0
+
+    print(f"kubectl simulator: unsupported get resource: {resource}", file=sys.stderr)
+    return 2
+
+
+def handle_exec(lab_home, args):
+    namespace = option_value(args, "-n", "--namespace") or "default"
+    pod_name = extract_exec_pod_name(args)
+    if not pod_name:
+        print("kubectl simulator: missing pod name", file=sys.stderr)
+        return 2
+
+    command = command_after_double_dash(args)
+    if not command:
+        command = ["/bin/bash"]
+
+    pod_root = ensure_pod_files(lab_home, namespace, pod_name)
+    env = os.environ.copy()
+    env["SSH_MCP_LAB_HOME"] = str(lab_home)
+    env["SSH_MCP_LAB_IN_POD"] = "1"
+    env["POD_NAMESPACE"] = namespace
+    env["POD_NAME"] = pod_name
+    env["POD_ROOT"] = str(pod_root)
+    env["HOSTNAME"] = pod_name
+    env["PS1"] = f"[pod:{namespace}/{pod_name} \\W]$ "
+
+    normalized = normalize_shell_command(command)
+    if is_interactive_shell(normalized):
+        print(f"Connected to pod {namespace}/{pod_name}. Fake pod root: {pod_root}")
+        print("Try: grep -n -i -- timeout ./var/log/app/app.log")
+        return subprocess.call(normalized, cwd=pod_root, env=env)
+
+    return subprocess.call(normalized, cwd=pod_root, env=env)
+
+
+def handle_logs(lab_home, args):
+    namespace = option_value(args, "-n", "--namespace") or "default"
+    pod_name = first_positional(args)
+    if not pod_name:
+        print("kubectl simulator: missing pod name", file=sys.stderr)
+        return 2
+
+    pod_root = ensure_pod_files(lab_home, namespace, pod_name)
+    log_path = pod_root / "var" / "log" / "app" / "app.log"
+    tail = int_option_value(args, "--tail", default=100)
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    for line in lines[-tail:]:
+        print(line)
+    return 0
+
+
+def ensure_pod_files(lab_home, namespace, pod_name):
+    app_name = app_for_pod(namespace, pod_name)
+    pod_root = lab_home / "runtime" / "pods" / namespace / pod_name
+    log_dir = pod_root / "var" / "log" / "app"
+    config_dir = pod_root / "etc" / "app"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    app_log = log_dir / "app.log"
+    error_log = log_dir / "error.log"
+    config_file = config_dir / "application.yaml"
+
+    if not app_log.exists():
+        app_log.write_text(sample_app_log(namespace, pod_name, app_name), encoding="utf-8")
+    if not error_log.exists():
+        error_log.write_text(sample_error_log(namespace, pod_name, app_name), encoding="utf-8")
+    if not config_file.exists():
+        config_file.write_text(
+            f"service: {app_name}\nnamespace: {namespace}\npod: {pod_name}\nlogLevel: INFO\n",
+            encoding="utf-8",
+        )
+    return pod_root
+
+
+def app_for_pod(namespace, pod_name):
+    for known_pod, _status, app in PODS.get(namespace, []):
+        if known_pod == pod_name:
+            return app
+    return pod_name.split("-")[0] if pod_name else "app"
+
+
+def sample_app_log(namespace, pod_name, app_name):
+    return "\n".join(
+        [
+            f"2026-06-05T10:00:01+08:00 INFO  {app_name} boot namespace={namespace} pod={pod_name}",
+            f"2026-06-05T10:00:03+08:00 INFO  {app_name} database connection ready",
+            f"2026-06-05T10:01:14+08:00 WARN  {app_name} upstream timeout after 3000ms traceId=lab-timeout-001",
+            f"2026-06-05T10:02:23+08:00 ERROR {app_name} payment failed orderId=O-10086 reason=insufficient balance",
+            f"2026-06-05T10:04:55+08:00 INFO  {app_name} retry success traceId=lab-timeout-001",
+            f"2026-06-05T10:08:12+08:00 ERROR {app_name} NullPointerException at FakeService.java:42",
+            "",
+        ]
+    )
+
+
+def sample_error_log(namespace, pod_name, app_name):
+    return "\n".join(
+        [
+            f"2026-06-05T10:02:23+08:00 ERROR {app_name} namespace={namespace} pod={pod_name} payment failed",
+            "java.lang.IllegalStateException: simulated payment gateway rejection",
+            "    at lab.fake.PaymentClient.charge(PaymentClient.java:31)",
+            "    at lab.fake.OrderService.submit(OrderService.java:88)",
+            "",
+        ]
+    )
+
+
+def first_positional(args):
+    skip_next = False
+    for item in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--":
+            return None
+        if item in {"-n", "--namespace", "-c", "--container"}:
+            skip_next = True
+            continue
+        if item.startswith("-"):
+            continue
+        return item
+    return None
+
+
+def option_value(args, *names):
+    for index, item in enumerate(args):
+        for name in names:
+            if item == name and index + 1 < len(args):
+                return args[index + 1]
+            if item.startswith(name + "="):
+                return item.split("=", 1)[1]
+    return None
+
+
+def int_option_value(args, name, default):
+    value = option_value(args, name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def extract_exec_pod_name(args):
+    skip_next = False
+    for item in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--":
+            break
+        if item in {"-n", "--namespace", "-c", "--container"}:
+            skip_next = True
+            continue
+        if item.startswith("--namespace=") or item.startswith("--container="):
+            continue
+        if item in {"-i", "-t", "-it", "-ti"}:
+            continue
+        if item.startswith("-"):
+            continue
+        return item
+    return None
+
+
+def command_after_double_dash(args):
+    if "--" not in args:
+        return []
+    index = args.index("--")
+    return args[index + 1 :]
+
+
+def normalize_shell_command(command):
+    if not command:
+        return ["/bin/bash"]
+    if command[0] in {"sh", "bash"}:
+        command[0] = "/bin/" + command[0]
+    if command[0] in {"/bin/bash", "/usr/bin/bash"}:
+        return [command[0], "--noprofile", "--norc", "-i"]
+    if command[0] in {"/bin/sh", "/usr/bin/sh"}:
+        return [command[0], "-i"]
+    return command
+
+
+def is_interactive_shell(command):
+    return bool(command and command[0] in {"/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"})
+
+
+def print_help():
+    print("kubectl simulator supports:")
+    print("  kubectl get ns")
+    print("  kubectl get pods -n orders")
+    print("  kubectl logs orders-api-7d9d65f8b4-2plxq -n orders --tail=20")
+    print("  kubectl exec -it orders-api-7d9d65f8b4-2plxq -n orders -- /bin/bash")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

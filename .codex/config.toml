@@ -1,0 +1,12 @@
+[mcp_servers.ssh-mcp]
+command = 'D:\dev\workspace\AI\ssh-mcp\.venv\Scripts\python.exe'
+args = ["-m", "ssh_mcp.server"]
+cwd = 'D:\dev\workspace\AI\ssh-mcp'
+env_vars = ["SSH_MCP_KEY_PASSPHRASE"]
+startup_timeout_sec = 30
+tool_timeout_sec = 600
+
+[mcp_servers.ssh-mcp.env]
+SSH_MCP_CONFIG = 'D:\dev\workspace\AI\ssh-mcp\config\profiles.json'
+SSH_MCP_LOG_PATH = 'D:\dev\workspace\AI\ssh-mcp\logs\ssh_mcp.log'
+SSH_MCP_TRANSCRIPTS_DIR = 'D:\dev\workspace\AI\ssh-mcp\transcripts'

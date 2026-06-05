@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "command": "${SSH_MCP_PROJECT:-D:/dev/workspace/AI/ssh-mcp}/.venv/Scripts/python.exe",
+      "args": ["-m", "ssh_mcp.server"],
+      "env": {
+        "SSH_MCP_CONFIG": "${SSH_MCP_PROJECT:-D:/dev/workspace/AI/ssh-mcp}/config/profiles.json",
+        "SSH_MCP_LOG_PATH": "${SSH_MCP_PROJECT:-D:/dev/workspace/AI/ssh-mcp}/logs/ssh_mcp.log",
+        "SSH_MCP_TRANSCRIPTS_DIR": "${SSH_MCP_PROJECT:-D:/dev/workspace/AI/ssh-mcp}/transcripts",
+        "SSH_MCP_KEY_PASSPHRASE": "${SSH_MCP_KEY_PASSPHRASE}"
+      },
+      "timeout": 600000
+    }
+  }
+}

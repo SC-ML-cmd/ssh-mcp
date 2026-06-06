@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import socket
@@ -9,6 +10,8 @@ import unittest
 import urllib.request
 
 from ssh_mcp.config import load_profile, load_profiles
+from ssh_mcp.log_config import configure_logging
+from ssh_mcp.runtime import build_runtime
 from ssh_mcp.session import SessionRegistry, TerminalBuffer, _key_classes_for_file, build_log_search_command
 from ssh_mcp.transcript import TranscriptWriter, list_transcript_summaries, read_events, render_terminal_delta
 from ssh_mcp.viewer import start_viewer_server
@@ -165,13 +168,69 @@ class SearchCommandTests(unittest.TestCase):
         self.assertIn("-C 2", command)
 
 
+class RuntimeTests(unittest.TestCase):
+    def test_runtime_uses_instance_directories_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_runtime = os.environ.get("SSH_MCP_RUNTIME_DIR")
+            old_log = os.environ.pop("SSH_MCP_LOG_PATH", None)
+            old_transcripts = os.environ.pop("SSH_MCP_TRANSCRIPTS_DIR", None)
+            os.environ["SSH_MCP_RUNTIME_DIR"] = temp_dir
+            try:
+                runtime = build_runtime(server_instance_id="server-1", client_label="codex-test")
+            finally:
+                _restore_env("SSH_MCP_RUNTIME_DIR", old_runtime)
+                _restore_env("SSH_MCP_LOG_PATH", old_log)
+                _restore_env("SSH_MCP_TRANSCRIPTS_DIR", old_transcripts)
+
+        self.assertEqual(runtime.instance_dir.name, "server-1")
+        self.assertEqual(runtime.log_path, Path(temp_dir) / "instances" / "server-1" / "logs" / "ssh_mcp.log")
+        self.assertEqual(runtime.transcripts_dir, Path(temp_dir) / "instances" / "server-1" / "transcripts")
+        self.assertEqual(runtime.client_label, "codex-test")
+
+    def test_runtime_respects_explicit_log_and_transcript_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_runtime = os.environ.get("SSH_MCP_RUNTIME_DIR")
+            old_log = os.environ.get("SSH_MCP_LOG_PATH")
+            old_transcripts = os.environ.get("SSH_MCP_TRANSCRIPTS_DIR")
+            os.environ["SSH_MCP_RUNTIME_DIR"] = str(Path(temp_dir) / "runtime")
+            os.environ["SSH_MCP_LOG_PATH"] = str(Path(temp_dir) / "custom.log")
+            os.environ["SSH_MCP_TRANSCRIPTS_DIR"] = str(Path(temp_dir) / "custom-transcripts")
+            try:
+                runtime = build_runtime(server_instance_id="server-2")
+            finally:
+                _restore_env("SSH_MCP_RUNTIME_DIR", old_runtime)
+                _restore_env("SSH_MCP_LOG_PATH", old_log)
+                _restore_env("SSH_MCP_TRANSCRIPTS_DIR", old_transcripts)
+
+        self.assertTrue(runtime.explicit_log_path)
+        self.assertTrue(runtime.explicit_transcripts_dir)
+        self.assertEqual(runtime.log_path, Path(temp_dir) / "custom.log")
+        self.assertEqual(runtime.transcripts_dir, Path(temp_dir) / "custom-transcripts")
+
+    def test_log_formatter_supplies_default_context_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "ssh_mcp.log"
+            configure_logging(log_path, context={"server_instance_id": "server-3", "client_label": "codex-test"})
+            logging.getLogger("test").info("hello")
+
+            text = log_path.read_text(encoding="utf-8")
+            for handler in list(logging.getLogger().handlers):
+                logging.getLogger().removeHandler(handler)
+                handler.close()
+
+        self.assertIn("server=server-3", text)
+        self.assertIn("client=codex-test", text)
+        self.assertIn("session=-", text)
+
+
 class ViewerTests(unittest.TestCase):
     def test_viewer_serves_sessions_and_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             writer = TranscriptWriter("session-1", temp_dir)
             writer.record("session_meta", "session metadata", extra={"profile": "dev", "owner_label": "codex-test"})
             writer.record("recv", "hello\n")
-            registry = SessionRegistry()
+            runtime = _build_test_runtime(temp_dir, server_instance_id="viewer-test", client_label="codex-test")
+            registry = SessionRegistry(runtime)
             viewer = start_viewer_server(registry, port="auto", transcripts_dir=temp_dir)
             try:
                 sessions = _json_get(f"{viewer.base_url}/api/sessions")
@@ -186,17 +245,109 @@ class ViewerTests(unittest.TestCase):
         self.assertIn("hello", events["terminal_delta"])
 
     def test_viewer_moves_to_next_port_when_requested_port_is_busy(self) -> None:
-        registry = SessionRegistry()
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
-            occupied.bind(("127.0.0.1", 0))
-            occupied.listen(1)
-            busy_port = occupied.getsockname()[1]
-            viewer = start_viewer_server(registry, port=str(busy_port))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="viewer-port-test"))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+                occupied.bind(("127.0.0.1", 0))
+                occupied.listen(1)
+                busy_port = occupied.getsockname()[1]
+                viewer = start_viewer_server(registry, port=str(busy_port))
+                try:
+                    self.assertNotEqual(viewer.port, busy_port)
+                    self.assertEqual(registry.server_info()["viewer_base_url"], viewer.base_url)
+                finally:
+                    viewer.shutdown()
+
+    def test_viewer_defaults_to_registry_runtime_transcripts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = _build_test_runtime(
+                temp_dir,
+                server_instance_id="viewer-runtime-test",
+                client_label="codex-test",
+                config_path=Path(temp_dir) / "profiles.json",
+            )
+            writer = TranscriptWriter("runtime-1", runtime.transcripts_dir)
+            writer.record("session_meta", "session metadata", extra={"profile": "dev", "server_instance_id": runtime.server_instance_id})
+            registry = SessionRegistry(runtime)
+            viewer = start_viewer_server(registry, port="auto")
             try:
-                self.assertNotEqual(viewer.port, busy_port)
-                self.assertEqual(registry.server_info()["viewer_base_url"], viewer.base_url)
+                sessions = _json_get(f"{viewer.base_url}/api/sessions")
             finally:
                 viewer.shutdown()
+
+        found = next(item for item in sessions["sessions"] if item["session_id"] == "runtime-1")
+        self.assertEqual(found["storage_scope"], "instance")
+        self.assertEqual(found["server_instance_id"], "viewer-runtime-test")
+
+    def test_viewer_reads_legacy_transcripts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_cwd = Path.cwd()
+            runtime_dir = Path(temp_dir) / "runtime"
+            legacy_dir = Path(temp_dir) / "transcripts"
+            legacy_dir.mkdir()
+            writer = TranscriptWriter("legacy-1", legacy_dir)
+            writer.record("recv", "legacy\n")
+            try:
+                os.chdir(temp_dir)
+                registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="viewer-legacy-test"))
+                viewer = start_viewer_server(registry, port="auto", transcripts_dir=runtime_dir / "instances" / "viewer-legacy-test" / "transcripts")
+                try:
+                    sessions = _json_get(f"{viewer.base_url}/api/sessions")
+                finally:
+                    viewer.shutdown()
+            finally:
+                os.chdir(old_cwd)
+
+        legacy = next(item for item in sessions["sessions"] if item["session_id"] == "legacy-1")
+        self.assertEqual(legacy["storage_scope"], "legacy")
+        self.assertEqual(legacy["server_instance_id"], "legacy")
+
+    def test_viewer_summarizes_session_health_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = TranscriptWriter("health-history-1", temp_dir)
+            writer.record("session_meta", "session metadata", extra={"profile": "dev"})
+            writer.record(
+                "session_health",
+                "SSH transport is inactive",
+                extra={"health_status": "unhealthy", "health_error": "SSH transport is inactive"},
+            )
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="viewer-health-test"))
+            viewer = start_viewer_server(registry, port="auto", transcripts_dir=temp_dir)
+            try:
+                sessions = _json_get(f"{viewer.base_url}/api/sessions")
+            finally:
+                viewer.shutdown()
+
+        health = next(item for item in sessions["sessions"] if item["session_id"] == "health-history-1")
+        self.assertEqual(health["status"], "unhealthy")
+        self.assertEqual(health["health_error"], "SSH transport is inactive")
+
+
+class HealthTests(unittest.TestCase):
+    def test_session_info_includes_health_fields(self) -> None:
+        session = _fake_session()
+        try:
+            info = session.info()
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(info["health_status"], "healthy")
+        self.assertIn("last_heartbeat_at", info)
+        self.assertIsNone(info["health_error"])
+
+    def test_health_check_marks_inactive_transport_unhealthy(self) -> None:
+        session = _fake_session(transport_active=False)
+        try:
+            with self.assertLogs("ssh_mcp.session", level="WARNING") as captured:
+                ok = session.check_health_once()
+            info = session.info()
+        finally:
+            _close_fake_session(session)
+
+        self.assertFalse(ok)
+        self.assertEqual(info["health_status"], "unhealthy")
+        self.assertIn("inactive", info["health_error"])
+        self.assertIn("SSH transport is inactive", captured.output[0])
 
 
 class KeyLoadingTests(unittest.TestCase):
@@ -222,6 +373,88 @@ class KeyLoadingTests(unittest.TestCase):
 def _json_get(url: str) -> dict:
     with urllib.request.urlopen(url, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _restore_env(name: str, value: str | None) -> None:
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+
+
+def _build_test_runtime(temp_dir: str, **kwargs):
+    old_runtime = os.environ.get("SSH_MCP_RUNTIME_DIR")
+    old_log = os.environ.pop("SSH_MCP_LOG_PATH", None)
+    old_transcripts = os.environ.pop("SSH_MCP_TRANSCRIPTS_DIR", None)
+    os.environ["SSH_MCP_RUNTIME_DIR"] = str(Path(temp_dir) / "runtime")
+    try:
+        return build_runtime(**kwargs)
+    finally:
+        _restore_env("SSH_MCP_RUNTIME_DIR", old_runtime)
+        _restore_env("SSH_MCP_LOG_PATH", old_log)
+        _restore_env("SSH_MCP_TRANSCRIPTS_DIR", old_transcripts)
+
+
+class _FakeTransport:
+    def __init__(self, active: bool = True) -> None:
+        self.active = active
+        self.keepalive_interval: int | None = None
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def set_keepalive(self, interval: int) -> None:
+        self.keepalive_interval = interval
+
+
+class _FakeClient:
+    def __init__(self, transport_active: bool = True) -> None:
+        self.transport = _FakeTransport(transport_active)
+        self.closed = False
+
+    def get_transport(self) -> _FakeTransport:
+        return self.transport
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeChannel:
+    closed = False
+
+    def recv_ready(self) -> bool:
+        return False
+
+    def exit_status_ready(self) -> bool:
+        return False
+
+    def send(self, payload: str) -> int:
+        return len(payload)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _fake_session(*, transport_active: bool = True):
+    from ssh_mcp.config import SshProfile
+
+    temp_dir = tempfile.TemporaryDirectory()
+    profile = SshProfile(name="fake", host="127.0.0.1", username="fake", keepalive_interval=3600)
+    session = __import__("ssh_mcp.session", fromlist=["SshSession"]).SshSession(
+        "fake-session",
+        profile,
+        _FakeClient(transport_active),
+        _FakeChannel(),
+        TranscriptWriter("fake-session", temp_dir.name),
+        server_instance_id="server-health-test",
+    )
+    session._test_temp_dir = temp_dir
+    return session
+
+
+def _close_fake_session(session) -> None:
+    session.close()
+    session._test_temp_dir.cleanup()
 
 
 if __name__ == "__main__":

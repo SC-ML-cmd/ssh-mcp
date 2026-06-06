@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .session import SessionRegistry
-from .transcript import get_transcripts_dir, list_transcript_summaries, read_events, render_terminal_delta
+from .transcript import DEFAULT_TRANSCRIPTS_DIR, get_transcripts_dir, list_transcript_summaries, read_events, render_terminal_delta
 
 
 LOGGER = logging.getLogger(__name__)
@@ -41,10 +41,22 @@ class ViewerServer:
 class ViewerState:
     def __init__(self, registry: SessionRegistry, transcripts_dir: str | Path | None = None) -> None:
         self.registry = registry
-        self.transcripts_dir = get_transcripts_dir(transcripts_dir)
+        self.transcripts_dir = get_transcripts_dir(transcripts_dir or registry.runtime.transcripts_dir)
+        self.legacy_transcripts_dir = DEFAULT_TRANSCRIPTS_DIR
 
     def sessions(self) -> list[dict[str, Any]]:
-        by_id = {session["session_id"]: session for session in list_transcript_summaries(self.transcripts_dir)}
+        by_id: dict[str, dict[str, Any]] = {}
+
+        for session in list_transcript_summaries(self.transcripts_dir):
+            session.setdefault("storage_scope", "instance")
+            by_id[session["session_id"]] = session
+
+        if self.legacy_transcripts_dir.resolve() != self.transcripts_dir.resolve():
+            for session in list_transcript_summaries(self.legacy_transcripts_dir):
+                session.setdefault("storage_scope", "legacy")
+                session.setdefault("server_instance_id", "legacy")
+                by_id.setdefault(session["session_id"], session)
+
         active_sessions = self.registry.list()
         active_ids = {active["session_id"] for active in active_sessions}
 
@@ -53,12 +65,15 @@ class ViewerState:
             current = by_id.get(session_id, {})
             current.update(active)
             current["closed"] = active.get("closed", False)
+            current["storage_scope"] = "active"
             by_id[session_id] = current
 
         sessions = list(by_id.values())
         for session in sessions:
             session["viewer_url"] = session.get("viewer_url") or self.registry.session_url(session["session_id"])
-            if session.get("closed"):
+            if session.get("health_status") == "unhealthy":
+                session["status"] = "unhealthy"
+            elif session.get("closed"):
                 session["status"] = "closed"
             elif session["session_id"] in active_ids:
                 session["status"] = "open"
@@ -80,7 +95,13 @@ class ViewerState:
         for active in self.registry.list():
             if active["session_id"] == session_id:
                 return Path(active["transcript_path"])
-        return self.transcripts_dir / f"{session_id}.jsonl"
+        instance_path = self.transcripts_dir / f"{session_id}.jsonl"
+        if instance_path.exists():
+            return instance_path
+        legacy_path = self.legacy_transcripts_dir / f"{session_id}.jsonl"
+        if legacy_path.exists():
+            return legacy_path
+        return instance_path
 
 
 def start_viewer_server(
@@ -219,6 +240,7 @@ def _index_html() -> str:
       --accent: #2f81f7;
       --ok: #3fb950;
       --closed: #f85149;
+      --warn: #d29922;
     }
     * { box-sizing: border-box; }
     body {
@@ -241,6 +263,8 @@ def _index_html() -> str:
     main { max-width: 1180px; margin: 0 auto; padding: 24px; }
     .meta { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     .sessions { display: grid; gap: 10px; }
+    .group { display: grid; gap: 10px; margin-bottom: 22px; }
+    .group-title { color: var(--muted); font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; }
     .session {
       display: grid;
       grid-template-columns: minmax(220px, 1.4fr) minmax(160px, 1fr) 120px 170px;
@@ -259,6 +283,7 @@ def _index_html() -> str:
     .id { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
     .status { width: max-content; padding: 2px 8px; border-radius: 999px; color: #fff; background: var(--muted); font-size: 12px; }
     .status.open { background: var(--ok); color: #0d1117; }
+    .status.unhealthy { background: var(--warn); color: #0d1117; }
     .status.closed { background: var(--closed); }
     .empty { padding: 36px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); text-align: center; }
     @media (max-width: 760px) {
@@ -294,7 +319,20 @@ def _index_html() -> str:
         sessionsNode.appendChild(empty);
         return;
       }
+      const groups = new Map();
       for (const session of payload.sessions) {
+        const groupKey = session.server_instance_id || session.storage_scope || "unknown";
+        if (!groups.has(groupKey)) groups.set(groupKey, []);
+        groups.get(groupKey).push(session);
+      }
+      for (const [groupKey, sessions] of groups) {
+        const group = document.createElement("section");
+        group.className = "group";
+        const groupTitle = document.createElement("div");
+        groupTitle.className = "group-title";
+        groupTitle.textContent = groupKey;
+        group.appendChild(groupTitle);
+        for (const session of sessions) {
         const link = document.createElement("a");
         link.className = "session";
         link.href = "/sessions/" + encodeURIComponent(session.session_id);
@@ -320,8 +358,10 @@ def _index_html() -> str:
         activity.className = "meta";
         activity.textContent = text(session.last_activity_at || session.updated_at);
 
-        link.append(title, target, status, activity);
-        sessionsNode.appendChild(link);
+          link.append(title, target, status, activity);
+          group.appendChild(link);
+        }
+        sessionsNode.appendChild(group);
       }
     }
 
@@ -357,6 +397,7 @@ def _session_html(session_id: str) -> str:
       --accent: #2f81f7;
       --ok: #3fb950;
       --closed: #f85149;
+      --warn: #d29922;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -384,6 +425,7 @@ def _session_html(session_id: str) -> str:
     .meta {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
     .status {{ width: max-content; padding: 2px 8px; border-radius: 999px; color: #fff; background: var(--muted); font-size: 12px; }}
     .status.open {{ background: var(--ok); color: #05070a; }}
+    .status.unhealthy {{ background: var(--warn); color: #05070a; }}
     .status.closed {{ background: var(--closed); }}
     #terminal {{
       margin: 0;
@@ -513,12 +555,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--transcripts-dir", default=None)
     args = parser.parse_args(argv)
 
+    registry = SessionRegistry()
     viewer = start_viewer_server(
-        SessionRegistry(),
+        registry,
         host=args.host,
         port=args.port,
         transcripts_dir=args.transcripts_dir,
     )
+    registry.runtime.write_meta(viewer_base_url=viewer.base_url)
     print(viewer.base_url, flush=True)
     try:
         while True:

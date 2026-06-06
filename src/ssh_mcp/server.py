@@ -8,8 +8,9 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import load_profile
+from .config import get_config_path, load_profile
 from .log_config import configure_logging
+from .runtime import build_runtime
 from .session import SessionRegistry, build_log_search_command
 from .viewer import start_viewer_server, viewer_defaults_from_env
 
@@ -211,11 +212,23 @@ def search_logs(
 
 
 def main(argv: list[str] | None = None) -> None:
+    global registry
+
     args = _parse_args(argv)
-    log_path = configure_logging()
+    runtime = build_runtime(config_path=get_config_path())
+    registry = SessionRegistry(runtime)
+    log_path = configure_logging(
+        runtime.log_path,
+        context={
+            "server_instance_id": runtime.server_instance_id,
+            "pid": runtime.as_dict().get("pid"),
+            "client_label": runtime.client_label or "-",
+        },
+    )
     LOGGER.info("Starting ssh-mcp, log_path=%s", log_path)
     viewer = start_viewer_server(registry, host=args.viewer_host, port=args.viewer_port)
     LOGGER.info("Viewer URL: %s", viewer.base_url)
+    runtime.write_meta(viewer_base_url=viewer.base_url)
     atexit.register(viewer.shutdown)
     atexit.register(registry.close_all)
     mcp.run()

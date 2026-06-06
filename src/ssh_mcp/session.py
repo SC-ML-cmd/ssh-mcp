@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 from .config import SshProfile
+from .runtime import ServerRuntime, build_runtime
 from .transcript import TranscriptWriter
 
 
@@ -114,12 +115,23 @@ class SshSession:
         self.buffer = TerminalBuffer()
         self.created_at = datetime.now().astimezone()
         self.last_activity_at = self.created_at
+        self.health_status = "healthy"
+        self.last_heartbeat_at = self.created_at
+        self.health_error: str | None = None
         self.closed = False
         self.read_error: str | None = None
         self._stop_event = threading.Event()
         self._write_lock = threading.Lock()
+        self._health_lock = threading.Lock()
+        self._health_event_recorded = False
         self._reader = threading.Thread(target=self._reader_loop, name=f"ssh-mcp-reader-{session_id}", daemon=True)
+        self._health_monitor = threading.Thread(
+            target=self._health_loop,
+            name=f"ssh-mcp-health-{session_id}",
+            daemon=True,
+        )
         self._reader.start()
+        self._health_monitor.start()
 
     def send_text(
         self,
@@ -191,6 +203,7 @@ class SshSession:
             self.client.close()
         except Exception:
             LOGGER.exception("Failed to close SSH client for %s", self.id)
+        self.health_status = "closed"
         self.transcript.record("event", "session closed")
 
     def info(self) -> dict[str, Any]:
@@ -205,6 +218,11 @@ class SshSession:
             "viewer_url": self.viewer_url,
             "created_at": self.created_at.isoformat(timespec="milliseconds"),
             "last_activity_at": self.last_activity_at.isoformat(timespec="milliseconds"),
+            "health_status": self.health_status,
+            "last_heartbeat_at": self.last_heartbeat_at.isoformat(timespec="milliseconds")
+            if self.last_heartbeat_at
+            else None,
+            "health_error": self.health_error,
             "closed": self.closed,
             "read_error": self.read_error,
             "transcript_path": str(self.transcript.path),
@@ -229,7 +247,64 @@ class SshSession:
                 LOGGER.exception("Reader loop failed for session %s", self.id)
                 self.transcript.record("error", str(exc))
                 break
+        if not self._stop_event.is_set() and self.health_status == "healthy":
+            self._mark_unhealthy("SSH reader loop ended", status="closed")
+        else:
+            self.closed = True
+            if self.health_status == "healthy":
+                self.health_status = "closed"
+
+    def check_health_once(self) -> bool:
+        if self.closed:
+            self._mark_unhealthy("session is closed", status="closed")
+            return False
+
+        try:
+            transport = self.client.get_transport()
+            if transport is None:
+                self._mark_unhealthy("SSH transport is missing")
+                return False
+            if not transport.is_active():
+                self._mark_unhealthy("SSH transport is inactive")
+                return False
+            if getattr(self.channel, "closed", False):
+                self._mark_unhealthy("SSH channel is closed")
+                return False
+        except Exception as exc:
+            self._mark_unhealthy(f"SSH health check failed: {exc}")
+            return False
+
+        with self._health_lock:
+            self.health_status = "healthy"
+            self.health_error = None
+            self.last_heartbeat_at = datetime.now().astimezone()
+        return True
+
+    def _health_loop(self) -> None:
+        interval = max(float(self.profile.keepalive_interval or 30.0), 1.0)
+        while not self._stop_event.wait(interval):
+            if not self.check_health_once():
+                return
+
+    def _mark_unhealthy(self, message: str, *, status: str = "unhealthy") -> None:
+        with self._health_lock:
+            if self.health_status == status and self.health_error == message:
+                return
+            self.health_status = status
+            self.health_error = message
+            self.last_heartbeat_at = datetime.now().astimezone()
+            first_record = not self._health_event_recorded
+            self._health_event_recorded = True
+
         self.closed = True
+        self._stop_event.set()
+        if first_record:
+            self.transcript.record("session_health", message, extra={"health_status": status, "health_error": message})
+        LOGGER.warning(
+            "SSH session health changed: %s",
+            message,
+            extra={"session_id": self.id, "owner_label": self.owner_label},
+        )
 
     def _send_payload(self, payload: str, *, tool: str, sensitive: bool) -> int:
         self._ensure_open()
@@ -274,7 +349,8 @@ class SshSession:
 
     def _ensure_open(self) -> None:
         if self.closed:
-            raise SessionError(f"Session '{self.id}' is closed.")
+            detail = f" {self.health_error}" if self.health_error else ""
+            raise SessionError(f"Session '{self.id}' is closed.{detail}")
         self._raise_if_reader_failed()
 
     def _raise_if_reader_failed(self) -> None:
@@ -283,11 +359,13 @@ class SshSession:
 
 
 class SessionRegistry:
-    def __init__(self) -> None:
+    def __init__(self, runtime: ServerRuntime | None = None) -> None:
         self._sessions: dict[str, SshSession] = {}
         self._lock = threading.Lock()
-        self.server_instance_id = _make_server_instance_id()
-        self.started_at = datetime.now().astimezone()
+        self.runtime = runtime or build_runtime()
+        self.server_instance_id = self.runtime.server_instance_id
+        self.client_label = self.runtime.client_label
+        self.started_at = self.runtime.started_at
         self.viewer_base_url: str | None = None
 
     def set_viewer_base_url(self, base_url: str | None) -> None:
@@ -304,6 +382,11 @@ class SessionRegistry:
             "pid": os.getpid(),
             "cwd": str(Path.cwd()),
             "started_at": self.started_at.isoformat(timespec="milliseconds"),
+            "client_label": self.client_label,
+            "runtime_dir": str(self.runtime.runtime_dir),
+            "instance_dir": str(self.runtime.instance_dir),
+            "log_path": str(self.runtime.log_path),
+            "transcripts_dir": str(self.runtime.transcripts_dir),
             "viewer_base_url": self.viewer_base_url,
         }
 
@@ -318,7 +401,7 @@ class SessionRegistry:
         import paramiko
 
         session_id = _make_session_id(profile.name)
-        transcript = TranscriptWriter(session_id)
+        transcript = TranscriptWriter(session_id, self.runtime.transcripts_dir)
         viewer_url = self.session_url(session_id)
         transcript.record(
             "session_meta",
@@ -330,8 +413,10 @@ class SessionRegistry:
                 "username": profile.username,
                 "owner_label": owner_label,
                 "server_instance_id": self.server_instance_id,
+                "client_label": self.client_label,
                 "pid": os.getpid(),
                 "cwd": str(Path.cwd()),
+                "instance_dir": str(self.runtime.instance_dir),
                 "viewer_url": viewer_url,
             },
         )
@@ -357,6 +442,9 @@ class SessionRegistry:
         LOGGER.info("Opening SSH session %s to %s@%s:%s", session_id, profile.username, profile.host, profile.port)
         try:
             client.connect(**connect_kwargs)
+            transport = client.get_transport()
+            if transport and profile.keepalive_interval > 0:
+                transport.set_keepalive(int(profile.keepalive_interval))
             channel = client.invoke_shell(term=profile.term, width=profile.width, height=profile.height)
         except Exception:
             client.close()
@@ -375,6 +463,7 @@ class SessionRegistry:
         transcript.record("event", "session opened")
         with self._lock:
             self._sessions[session_id] = session
+        LOGGER.info("Opened SSH session", extra={"session_id": session_id, "owner_label": owner_label})
         return session
 
     def get(self, session_id: str) -> SshSession:
@@ -437,11 +526,6 @@ def _make_session_id(profile_name: str) -> str:
     safe_name = "".join(ch if ch in string.ascii_letters + string.digits + "-_" else "-" for ch in profile_name)
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     return f"{safe_name}-{timestamp}-{secrets.token_hex(3)}"
-
-
-def _make_server_instance_id() -> str:
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-    return f"ssh-mcp-{timestamp}-{secrets.token_hex(4)}"
 
 
 def _load_private_key(profile: SshProfile, passphrase: str | None) -> Any:

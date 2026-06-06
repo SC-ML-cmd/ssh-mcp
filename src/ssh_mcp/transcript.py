@@ -165,6 +165,11 @@ def _summarize_transcript(path: Path) -> dict[str, Any] | None:
             for key, value in event.items():
                 if key not in {"dir", "text", "ts", "line"}:
                     summary[key] = value
+        elif direction == "session_health":
+            summary["health_status"] = event.get("health_status") or "unhealthy"
+            summary["health_error"] = event.get("health_error") or text
+            if summary["health_status"] in {"closed", "unhealthy"}:
+                summary["closed"] = True
         elif direction == "event" and text == "session closed":
             summary["closed"] = True
 

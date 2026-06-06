@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 logs/
 transcripts/
+runtime/
 config/profiles.json
 lab/cmsm_simulator/runtime/

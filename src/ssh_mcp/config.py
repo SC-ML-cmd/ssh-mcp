@@ -34,6 +34,7 @@ class SshProfile:
     term: str = "xterm-256color"
     width: int = 120
     height: int = 40
+    keepalive_interval: float = 30.0
 
     def resolved_password(self, override: str | None = None) -> str | None:
         return override if override is not None else _secret_from_value_or_env(self.password, self.password_env)
@@ -106,6 +107,7 @@ def _parse_profile(name: str, data: dict[str, Any]) -> SshProfile:
         term=str(data.get("term", "xterm-256color")),
         width=int(data.get("width", 120)),
         height=int(data.get("height", 40)),
+        keepalive_interval=float(data.get("keepalive_interval", os.getenv("SSH_MCP_KEEPALIVE_INTERVAL") or 30.0)),
     )
 
 

@@ -11,15 +11,16 @@
       "auto_add_host_key": true,
       "term": "xterm-256color",
       "width": 120,
-      "height": 40
+      "height": 40,
+      "keepalive_interval": 30
     },
     "password-dev": {
       "host": "10.0.0.11",
       "username": "your-user",
       "password_env": "SSH_MCP_PASSWORD",
       "allow_agent": false,
-      "look_for_keys": false
+      "look_for_keys": false,
+      "keepalive_interval": 30
     }
   }
 }
-

@@ -8,5 +8,5 @@ tool_timeout_sec = 600
 
 [mcp_servers.ssh-mcp.env]
 SSH_MCP_CONFIG = 'D:\dev\workspace\AI\ssh-mcp\config\profiles.json'
-SSH_MCP_LOG_PATH = 'D:\dev\workspace\AI\ssh-mcp\logs\ssh_mcp.log'
-SSH_MCP_TRANSCRIPTS_DIR = 'D:\dev\workspace\AI\ssh-mcp\transcripts'
+SSH_MCP_RUNTIME_DIR = 'D:\dev\workspace\AI\ssh-mcp\runtime'
+SSH_MCP_CLIENT_LABEL = 'codex'

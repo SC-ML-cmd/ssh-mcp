@@ -10,6 +10,9 @@
 - `reopen_session(session_id)`：基于旧 session 的 profile 打开一个新的 SSH 登录，不重放菜单或命令。
 - `send_text(session_id, text, enter=True, wait_for="", timeout=30)`：向菜单或 shell 发送文本。
 - `execute_command(session_id, command, wait_for_prompt=True, timeout=30)`：在当前 shell 状态下执行命令。
+- `get_command(session_id, command_id)`：查询已跟踪命令的状态、退出码和已收集输出。
+- `list_commands(session_id)`：查看当前 session 的命令历史。
+- `cancel_command(session_id, command_id)`：对正在运行的跟踪命令发送 `Ctrl+C`。
 - `get_screen(session_id, lines=100)`：查看内存中最近的终端输出。
 - `get_transcript(session_id, tail=200)`：读取 JSONL 审计记录。
 - `interrupt(session_id)`：发送 `Ctrl+C`。
@@ -142,6 +145,26 @@ MCP Server 启动时会同时启动本地 viewer。默认从 `8765` 附近自动
 ```powershell
 .\.venv\Scripts\python.exe -m ssh_mcp.viewer --port 8765 --transcripts-dir transcripts
 ```
+
+## 长命令与后台轮询
+
+`execute_command` 默认会为命令生成 `command_id` 和完成 marker。命令在 `timeout` 内结束时，返回 `status=completed`、`exit_code` 和输出；命令超过 `timeout` 时，返回 `status=running`、`timed_out=true` 和 `command_id`，reader 线程会继续读取远端输出并写入 transcript。
+
+后续可用 `get_command` 轮询：
+
+```json
+{"session_id": "lab-...", "command_id": "cmd-..."}
+```
+
+命令状态含义：
+
+- `running`：命令仍在执行，输出还会继续增长。
+- `completed`：检测到 marker，已有退出码。
+- `cancel_requested`：已通过 `cancel_command` 发送 `Ctrl+C`，等待远端 shell 返回。
+- `cancelled`：取消后检测到 marker，并且退出码非 0。
+- `failed` / `session_closed`：reader 或 SSH session 断开，命令无法继续跟踪。
+
+同一个交互式 session 同一时间只允许一个被 marker 跟踪的 `execute_command`。这是为了避免多个长命令共享同一个 PTY 输出流时，结果互相混淆。已经被 reader 收到的输出会持续写入 transcript；内存中的命令输出有上限，超大输出应以 transcript 为准。
 
 ## Runtime 目录
 

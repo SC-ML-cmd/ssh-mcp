@@ -173,6 +173,57 @@ def execute_command(
 
 
 @mcp.tool()
+def get_command(session_id: str, command_id: str, output_limit: int | None = None) -> dict[str, Any]:
+    """Return status and collected output for a tracked command."""
+    try:
+        session = registry.get(session_id)
+        return {
+            "ok": True,
+            "command": session.get_command(command_id, output_limit=output_limit),
+            "transcript_path": str(session.transcript.path),
+        }
+    except SessionError as exc:
+        LOGGER.warning("get_command failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
+    except Exception as exc:
+        LOGGER.exception("get_command failed")
+        return _session_error_response(exc, session if "session" in locals() else None)
+
+
+@mcp.tool()
+def list_commands(session_id: str, output_limit: int = 0) -> dict[str, Any]:
+    """List tracked command history for a session."""
+    try:
+        session = registry.get(session_id)
+        return {
+            "ok": True,
+            "commands": session.list_commands(output_limit=output_limit),
+            "transcript_path": str(session.transcript.path),
+        }
+    except SessionError as exc:
+        LOGGER.warning("list_commands failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
+    except Exception as exc:
+        LOGGER.exception("list_commands failed")
+        return _session_error_response(exc, session if "session" in locals() else None)
+
+
+@mcp.tool()
+def cancel_command(session_id: str, command_id: str) -> dict[str, Any]:
+    """Send Ctrl+C for a running tracked command."""
+    try:
+        session = registry.get(session_id)
+        result = session.cancel_command(command_id)
+        return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
+    except SessionError as exc:
+        LOGGER.warning("cancel_command failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
+    except Exception as exc:
+        LOGGER.exception("cancel_command failed")
+        return _session_error_response(exc, session if "session" in locals() else None)
+
+
+@mcp.tool()
 def get_screen(session_id: str, lines: int = 100) -> dict[str, Any]:
     """Return the latest terminal output kept in memory."""
     try:

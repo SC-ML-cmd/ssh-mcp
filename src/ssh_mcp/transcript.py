@@ -11,7 +11,7 @@ from typing import Any
 
 
 DEFAULT_TRANSCRIPTS_DIR = Path("transcripts")
-_DONE_MARKER_RE = re.compile(r"^.*__SSH_MCP_DONE_[0-9a-f]+__.*(?:\r?\n)?", re.MULTILINE)
+_DONE_MARKER_RE = re.compile(r"^.*__SSH_MCP_DONE_[A-Za-z0-9_-]+__.*(?:\r?\n)?", re.MULTILINE)
 
 
 class TranscriptWriter:

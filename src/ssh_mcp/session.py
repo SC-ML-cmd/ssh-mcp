@@ -22,6 +22,7 @@ from .transcript import TranscriptWriter
 
 LOGGER = logging.getLogger(__name__)
 MAX_BUFFER_CHARS = 200_000
+MAX_COMMAND_OUTPUT_CHARS = 5_000_000
 
 
 class SessionError(RuntimeError):
@@ -84,6 +85,9 @@ class CommandResult:
     exit_code: int | None
     timed_out: bool
     matched: str | None
+    command_id: str | None = None
+    status: str | None = None
+    output_truncated: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -91,7 +95,128 @@ class CommandResult:
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
             "matched": self.matched,
+            "command_id": self.command_id,
+            "status": self.status,
+            "output_truncated": self.output_truncated,
         }
+
+
+class TrackedCommand:
+    """Tracks one marker-wrapped command across tool timeouts while reader keeps draining PTY output."""
+
+    def __init__(
+        self,
+        command_id: str,
+        command: str,
+        marker: str,
+        marker_pattern: re.Pattern[str],
+        start_offset: int,
+        *,
+        max_output_chars: int = MAX_COMMAND_OUTPUT_CHARS,
+    ) -> None:
+        self.command_id = command_id
+        self.command = command
+        self.marker = marker
+        self.marker_pattern = marker_pattern
+        self.start_offset = start_offset
+        self.max_output_chars = max_output_chars
+        self.started_at = datetime.now().astimezone()
+        self.updated_at = self.started_at
+        self.completed_at: datetime | None = None
+        self.status = "running"
+        self.exit_code: int | None = None
+        self.matched: str | None = None
+        self.error: str | None = None
+        self.last_timeout_at: datetime | None = None
+        self.cancel_requested_at: datetime | None = None
+        self._chunks: deque[str] = deque()
+        self._total_output_chars = 0
+        self._dropped_output_chars = 0
+
+    def append_output(self, text: str) -> None:
+        if not text:
+            return
+        self._chunks.append(text)
+        self._total_output_chars += len(text)
+        self.updated_at = datetime.now().astimezone()
+        self._trim_output()
+        self.refresh_status()
+
+    def refresh_status(self) -> None:
+        if self.status not in {"running", "cancel_requested"}:
+            return
+        match = self.marker_pattern.search(self.output())
+        if not match:
+            return
+        self.exit_code = int(match.group(1))
+        self.status = "cancelled" if self.cancel_requested_at and self.exit_code != 0 else "completed"
+        self.matched = self.marker
+        self.completed_at = datetime.now().astimezone()
+        self.updated_at = self.completed_at
+
+    def mark_timeout(self) -> None:
+        self.last_timeout_at = datetime.now().astimezone()
+        self.updated_at = self.last_timeout_at
+
+    def mark_cancel_requested(self) -> None:
+        self.cancel_requested_at = datetime.now().astimezone()
+        self.updated_at = self.cancel_requested_at
+        if self.status == "running":
+            self.status = "cancel_requested"
+
+    def mark_failed(self, error: str, *, status: str = "failed") -> None:
+        if self.status in {"completed", "failed", "session_closed"}:
+            return
+        self.status = status
+        self.error = error
+        self.completed_at = datetime.now().astimezone()
+        self.updated_at = self.completed_at
+
+    def output(self) -> str:
+        return "".join(self._chunks)
+
+    def output_for_response(self, limit: int | None = None) -> tuple[str, bool]:
+        text = self.output()
+        truncated = self.output_truncated
+        if limit == 0:
+            return "", bool(text) or truncated
+        if limit is not None and limit >= 0 and len(text) > limit:
+            text = text[-limit:]
+            truncated = True
+        return text, truncated
+
+    @property
+    def output_truncated(self) -> bool:
+        return self._dropped_output_chars > 0
+
+    def info(self, *, output_limit: int | None = None) -> dict[str, Any]:
+        output, truncated = self.output_for_response(output_limit)
+        return {
+            "command_id": self.command_id,
+            "command": self.command,
+            "status": self.status,
+            "started_at": self.started_at.isoformat(timespec="milliseconds"),
+            "updated_at": self.updated_at.isoformat(timespec="milliseconds"),
+            "completed_at": self.completed_at.isoformat(timespec="milliseconds") if self.completed_at else None,
+            "exit_code": self.exit_code,
+            "timed_out": self.status == "running" and self.last_timeout_at is not None,
+            "last_timeout_at": self.last_timeout_at.isoformat(timespec="milliseconds") if self.last_timeout_at else None,
+            "cancel_requested_at": self.cancel_requested_at.isoformat(timespec="milliseconds")
+            if self.cancel_requested_at
+            else None,
+            "matched": self.matched,
+            "marker": self.marker,
+            "error": self.error,
+            "output": output,
+            "output_chars": self._total_output_chars,
+            "output_dropped_chars": self._dropped_output_chars,
+            "output_truncated": truncated,
+        }
+
+    def _trim_output(self) -> None:
+        while self._chunks and sum(len(chunk) for chunk in self._chunks) > self.max_output_chars:
+            dropped = self._chunks.popleft()
+            self._dropped_output_chars += len(dropped)
 
 
 class SshSession:
@@ -132,6 +257,9 @@ class SshSession:
         self._stop_event = threading.Event()
         self._write_lock = threading.Lock()
         self._health_lock = threading.Lock()
+        self._command_lock = threading.Lock()
+        self._commands: dict[str, TrackedCommand] = {}
+        self._active_command_id: str | None = None
         self._health_event_recorded = False
         self._reader = threading.Thread(target=self._reader_loop, name=f"ssh-mcp-reader-{session_id}", daemon=True)
         self._health_monitor = threading.Thread(
@@ -179,23 +307,85 @@ class SshSession:
         if not wait_for_prompt:
             return self.send_text(command, enter=True, wait_for="", timeout=timeout, tool="execute_command")
 
-        marker = f"__SSH_MCP_DONE_{secrets.token_hex(8)}__"
-        marker_pattern = re.compile(rf"{re.escape(marker)}:(-?\d+)")
-        # 在远端 shell 里追加唯一 marker，用它判断命令结束并提取退出码。
-        wrapped = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\""
-        offset = self._send_payload(wrapped + "\n", tool="execute_command", sensitive=False)
-        match = self._wait_for_regex(marker_pattern, offset, timeout)
-        output = self.buffer.text_since(offset)
-        exit_code = int(match.group(1)) if match else None
+        tracked = self._start_tracked_command(command)
+        completed = self._wait_for_command(tracked.command_id, timeout)
+        info = tracked.info()
+        timed_out = not completed and info["status"] in {"running", "cancel_requested"}
+        if timed_out:
+            tracked.mark_timeout()
+            self.transcript.record(
+                "command_timeout",
+                "command still running after tool timeout",
+                extra=tracked.info(output_limit=0),
+            )
+        info = tracked.info()
         return CommandResult(
-            output=output,
-            exit_code=exit_code,
-            timed_out=match is None,
-            matched=marker if match else None,
+            output=info["output"],
+            exit_code=info["exit_code"],
+            timed_out=timed_out,
+            matched=info["matched"],
+            command_id=tracked.command_id,
+            status=info["status"],
+            output_truncated=info["output_truncated"],
         )
 
     def interrupt(self) -> CommandResult:
         return self.send_text("\x03", enter=False, wait_for="", timeout=1.0, tool="interrupt")
+
+    def get_command(self, command_id: str, *, output_limit: int | None = None) -> dict[str, Any]:
+        with self._command_lock:
+            command = self._commands.get(command_id)
+            if not command:
+                raise SessionError(f"Unknown command_id: {command_id}")
+            command.refresh_status()
+            return command.info(output_limit=output_limit)
+
+    def list_commands(self, *, output_limit: int = 0) -> list[dict[str, Any]]:
+        with self._command_lock:
+            commands = list(self._commands.values())
+            for command in commands:
+                command.refresh_status()
+            commands.sort(key=lambda item: item.started_at, reverse=True)
+            return [command.info(output_limit=output_limit) for command in commands]
+
+    def cancel_command(self, command_id: str) -> CommandResult:
+        with self._command_lock:
+            command = self._commands.get(command_id)
+            if not command:
+                raise SessionError(f"Unknown command_id: {command_id}")
+            if command.status not in {"running", "cancel_requested"}:
+                info = command.info()
+                return CommandResult(
+                    output=info["output"],
+                    exit_code=info["exit_code"],
+                    timed_out=False,
+                    matched=info["matched"],
+                    command_id=command_id,
+                    status=info["status"],
+                    output_truncated=info["output_truncated"],
+                )
+            command.mark_cancel_requested()
+            self.transcript.record(
+                "command_cancel",
+                "Ctrl+C requested for tracked command",
+                extra=command.info(output_limit=0),
+            )
+        self._send_payload(
+            "\x03",
+            tool="cancel_command",
+            sensitive=False,
+            extra={"command_id": command_id},
+        )
+        info = self.get_command(command_id)
+        return CommandResult(
+            output=info["output"],
+            exit_code=info["exit_code"],
+            timed_out=info["status"] in {"running", "cancel_requested"},
+            matched=info["matched"],
+            command_id=command_id,
+            status=info["status"],
+            output_truncated=info["output_truncated"],
+        )
 
     def screen(self, lines: int = 100) -> str:
         return self.buffer.last_lines(lines)
@@ -205,6 +395,7 @@ class SshSession:
             return
         self.closed = True
         self._stop_event.set()
+        self._mark_active_command_failed("session closed", status="session_closed")
         try:
             self.channel.close()
         except Exception:
@@ -238,6 +429,8 @@ class SshSession:
             "closed": self.closed,
             "read_error": self.read_error,
             "transcript_path": str(self.transcript.path),
+            "active_command_id": self._active_command_id,
+            "commands": self.list_commands(output_limit=0),
         }
 
     def error_info(self, message: str) -> dict[str, Any]:
@@ -264,8 +457,7 @@ class SshSession:
                     if not data:
                         break
                     text = data.decode("utf-8", errors="replace")
-                    self.buffer.append(text)
-                    self.transcript.record("recv", text)
+                    self._record_recv_text(text)
                     continue
                 if self.channel.exit_status_ready():
                     break
@@ -327,6 +519,7 @@ class SshSession:
 
         self.closed = True
         self._stop_event.set()
+        self._mark_active_command_failed(message, status="session_closed")
         if first_record:
             self.transcript.record("session_health", message, extra={"health_status": status, "health_error": message})
         LOGGER.warning(
@@ -335,14 +528,110 @@ class SshSession:
             extra={"session_id": self.id, "owner_label": self.owner_label},
         )
 
-    def _send_payload(self, payload: str, *, tool: str, sensitive: bool) -> int:
+    def _send_payload(
+        self,
+        payload: str,
+        *,
+        tool: str,
+        sensitive: bool,
+        extra: dict[str, Any] | None = None,
+    ) -> int:
         self._ensure_open()
         offset, _ = self.buffer.snapshot()
         with self._write_lock:
             self.channel.send(payload)
             self.last_activity_at = datetime.now().astimezone()
-            self.transcript.record("send", payload, tool=tool, sensitive=sensitive)
+            self.transcript.record("send", payload, tool=tool, sensitive=sensitive, extra=extra)
         return offset
+
+    def _start_tracked_command(self, command: str) -> TrackedCommand:
+        self._ensure_open()
+        with self._command_lock:
+            if self._active_command_id:
+                active = self._commands.get(self._active_command_id)
+                if active and active.status in {"running", "cancel_requested"}:
+                    raise SessionError(
+                        f"Session '{self.id}' already has running command {active.command_id}. "
+                        "Poll it with get_command or cancel it before starting another tracked command."
+                    )
+                self._active_command_id = None
+
+            command_id = _make_command_id()
+            marker = f"__SSH_MCP_DONE_{command_id}__"
+            marker_pattern = re.compile(rf"{re.escape(marker)}:(-?\d+)")
+            offset, _ = self.buffer.snapshot()
+            tracked = TrackedCommand(command_id, command, marker, marker_pattern, offset)
+            self._commands[command_id] = tracked
+            self._active_command_id = command_id
+
+        self.transcript.record(
+            "command_start",
+            "tracked command started",
+            extra=tracked.info(output_limit=0),
+        )
+        wrapped = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\""
+        try:
+            self._send_payload(
+                wrapped + "\n",
+                tool="execute_command",
+                sensitive=False,
+                extra={"command_id": command_id, "command_marker": marker},
+            )
+        except Exception:
+            with self._command_lock:
+                if self._active_command_id == command_id:
+                    self._active_command_id = None
+                tracked.mark_failed("failed to send command")
+                failed_info = tracked.info(output_limit=0)
+            self.transcript.record("command_failed", "tracked command failed", extra=failed_info)
+            raise
+        return tracked
+
+    def _record_recv_text(self, text: str) -> None:
+        self.buffer.append(text)
+        extra: dict[str, Any] | None = None
+        completed: TrackedCommand | None = None
+        with self._command_lock:
+            active = self._commands.get(self._active_command_id or "")
+            if active:
+                active.append_output(text)
+                extra = {"command_id": active.command_id}
+                if active.status in {"completed", "cancelled"}:
+                    completed = active
+                    self._active_command_id = None
+        self.transcript.record("recv", text, extra=extra)
+        if completed:
+            self.transcript.record(
+                "command_complete",
+                "tracked command completed",
+                extra=completed.info(output_limit=0),
+            )
+
+    def _wait_for_command(self, command_id: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._raise_if_reader_failed()
+            with self._command_lock:
+                command = self._commands.get(command_id)
+                if not command:
+                    raise SessionError(f"Unknown command_id: {command_id}")
+                command.refresh_status()
+                if command.status in {"completed", "cancelled", "failed", "session_closed"}:
+                    return command.status in {"completed", "cancelled"}
+            if self.closed:
+                return False
+            time.sleep(0.05)
+        return False
+
+    def _mark_active_command_failed(self, error: str, *, status: str) -> None:
+        with self._command_lock:
+            active = self._commands.get(self._active_command_id or "")
+            if not active:
+                return
+            active.mark_failed(error, status=status)
+            self._active_command_id = None
+            info = active.info(output_limit=0)
+        self.transcript.record("command_failed", "tracked command failed", extra=info)
 
     def _wait_for(self, needle: str, offset: int, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -624,6 +913,11 @@ def _make_session_id(profile_name: str) -> str:
     safe_name = "".join(ch if ch in string.ascii_letters + string.digits + "-_" else "-" for ch in profile_name)
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     return f"{safe_name}-{timestamp}-{secrets.token_hex(3)}"
+
+
+def _make_command_id() -> str:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return f"cmd-{timestamp}-{secrets.token_hex(3)}"
 
 
 def _load_private_key(profile: SshProfile, passphrase: str | None) -> Any:

@@ -441,6 +441,90 @@ class ReopenTests(unittest.TestCase):
         self.assertTrue(any(event["text"] == "reopen succeeded" and event["new_session_id"] == "fake-reopened" for event in previous_events))
 
 
+class CommandTrackingTests(unittest.TestCase):
+    def test_execute_command_timeout_returns_running_command_id(self) -> None:
+        session = _fake_session()
+        try:
+            result = session.execute_command("sleep 10", timeout=0.01)
+            command = session.get_command(result.command_id)
+            events = session.transcript.tail(20)
+        finally:
+            _close_fake_session(session)
+
+        self.assertTrue(result.timed_out)
+        self.assertIsNotNone(result.command_id)
+        self.assertEqual(result.status, "running")
+        self.assertEqual(command["status"], "running")
+        self.assertEqual(command["command"], "sleep 10")
+        self.assertTrue(any(event["dir"] == "command_timeout" and event["command_id"] == result.command_id for event in events))
+
+    def test_background_reader_completes_timed_out_command(self) -> None:
+        session = _fake_session()
+        try:
+            result = session.execute_command("slow-command", timeout=0.01)
+            command = session.get_command(result.command_id, output_limit=0)
+            session._record_recv_text("slow-command\r\npartial output\r\n")
+            session._record_recv_text(f"\r\n{command['marker']}:0\r\n[root@host ~]# ")
+            completed = session.get_command(result.command_id)
+            commands = session.list_commands()
+            events = session.transcript.tail(20)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["exit_code"], 0)
+        self.assertIn("partial output", completed["output"])
+        self.assertEqual(commands[0]["command_id"], result.command_id)
+        self.assertTrue(any(event["dir"] == "command_complete" and event["command_id"] == result.command_id for event in events))
+
+    def test_rejects_second_tracked_command_while_one_is_running(self) -> None:
+        session = _fake_session()
+        try:
+            first = session.execute_command("sleep 10", timeout=0.01)
+            with self.assertRaisesRegex(Exception, first.command_id):
+                session.execute_command("pwd", timeout=0.01)
+        finally:
+            _close_fake_session(session)
+
+    def test_cancel_command_sends_ctrl_c_and_marks_command(self) -> None:
+        session = _fake_session()
+        try:
+            result = session.execute_command("sleep 10", timeout=0.01)
+            cancelled = session.cancel_command(result.command_id)
+            command = session.get_command(result.command_id)
+            events = session.transcript.tail(20)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(cancelled.command_id, result.command_id)
+        self.assertEqual(command["status"], "cancel_requested")
+        self.assertIn("\x03", session.channel.sent_payloads[-1])
+        self.assertTrue(any(event["dir"] == "command_cancel" and event["command_id"] == result.command_id for event in events))
+
+    def test_server_command_polling_tools(self) -> None:
+        import ssh_mcp.server as server_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="server-command-test"))
+            session = _fake_session()
+            with registry._lock:
+                registry._sessions[session.id] = session
+            old_registry = server_module.registry
+            server_module.registry = registry
+            try:
+                started = server_module.execute_command(session.id, "slow-command", timeout=0.01)
+                polled = server_module.get_command(session.id, started["command_id"], output_limit=0)
+                listed = server_module.list_commands(session.id, output_limit=0)
+            finally:
+                server_module.registry = old_registry
+                registry.close_all()
+                session._test_temp_dir.cleanup()
+
+        self.assertTrue(started["timed_out"])
+        self.assertEqual(polled["command"]["command_id"], started["command_id"])
+        self.assertEqual(listed["commands"][0]["command_id"], started["command_id"])
+
+
 class KeyLoadingTests(unittest.TestCase):
     def test_rsa_pem_header_prefers_rsa_loader(self) -> None:
         class FakeParamiko:
@@ -511,7 +595,9 @@ class _FakeClient:
 
 
 class _FakeChannel:
-    closed = False
+    def __init__(self) -> None:
+        self.closed = False
+        self.sent_payloads: list[str] = []
 
     def recv_ready(self) -> bool:
         return False
@@ -520,6 +606,7 @@ class _FakeChannel:
         return False
 
     def send(self, payload: str) -> int:
+        self.sent_payloads.append(payload)
         return len(payload)
 
     def close(self) -> None:

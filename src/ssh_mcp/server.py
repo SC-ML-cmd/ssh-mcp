@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import atexit
 import logging
+import sys
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -9,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from .config import load_profile
 from .log_config import configure_logging
 from .session import SessionRegistry, build_log_search_command
+from .viewer import start_viewer_server, viewer_defaults_from_env
 
 
 LOGGER = logging.getLogger(__name__)
@@ -22,12 +25,13 @@ def open_session(
     config_path: str | None = None,
     password: str | None = None,
     passphrase: str | None = None,
+    owner_label: str | None = None,
 ) -> dict[str, Any]:
     """Open a persistent interactive SSH session from a named profile."""
     try:
         ssh_profile = load_profile(profile, config_path)
-        session = registry.open(ssh_profile, password=password, passphrase=passphrase)
-        return {"ok": True, "session": session.info()}
+        session = registry.open(ssh_profile, password=password, passphrase=passphrase, owner_label=owner_label)
+        return {"ok": True, "session": session.info(), "viewer_url": session.viewer_url}
     except Exception as exc:
         LOGGER.exception("open_session failed")
         return {"ok": False, "error": str(exc)}
@@ -73,7 +77,7 @@ def diagnose_profile(profile: str, config_path: str | None = None) -> dict[str, 
 @mcp.tool()
 def list_sessions() -> dict[str, Any]:
     """List active sessions owned by this MCP process."""
-    return {"ok": True, "sessions": registry.list()}
+    return {"ok": True, "server": registry.server_info(), "sessions": registry.list()}
 
 
 @mcp.tool()
@@ -206,11 +210,30 @@ def search_logs(
         return {"ok": False, "error": str(exc), "command": command}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
     log_path = configure_logging()
     LOGGER.info("Starting ssh-mcp, log_path=%s", log_path)
+    viewer = start_viewer_server(registry, host=args.viewer_host, port=args.viewer_port)
+    LOGGER.info("Viewer URL: %s", viewer.base_url)
+    atexit.register(viewer.shutdown)
     atexit.register(registry.close_all)
     mcp.run()
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    default_host, default_port = viewer_defaults_from_env()
+    parser = argparse.ArgumentParser(description="Run the SSH MCP server.")
+    parser.add_argument("--viewer-host", default=default_host, help="Viewer bind host. Defaults to 127.0.0.1.")
+    parser.add_argument(
+        "--viewer-port",
+        default=default_port,
+        help="Viewer port or 'auto'. Defaults to SSH_MCP_VIEWER_PORT or auto.",
+    )
+    args, unknown = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    if unknown:
+        LOGGER.debug("Ignoring unknown ssh-mcp args: %s", unknown)
+    return args
 
 
 if __name__ == "__main__":

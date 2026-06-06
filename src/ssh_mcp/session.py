@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 import logging
+import os
 from pathlib import Path
 import re
 import secrets
@@ -12,6 +13,7 @@ import string
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 
 from .config import SshProfile
 from .transcript import TranscriptWriter
@@ -89,12 +91,26 @@ class CommandResult:
 
 
 class SshSession:
-    def __init__(self, session_id: str, profile: SshProfile, client: Any, channel: Any, transcript: TranscriptWriter) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        profile: SshProfile,
+        client: Any,
+        channel: Any,
+        transcript: TranscriptWriter,
+        *,
+        owner_label: str | None = None,
+        server_instance_id: str,
+        viewer_url: str | None = None,
+    ) -> None:
         self.id = session_id
         self.profile = profile
         self.client = client
         self.channel = channel
         self.transcript = transcript
+        self.owner_label = owner_label
+        self.server_instance_id = server_instance_id
+        self.viewer_url = viewer_url
         self.buffer = TerminalBuffer()
         self.created_at = datetime.now().astimezone()
         self.last_activity_at = self.created_at
@@ -184,6 +200,9 @@ class SshSession:
             "host": self.profile.host,
             "port": self.profile.port,
             "username": self.profile.username,
+            "owner_label": self.owner_label,
+            "server_instance_id": self.server_instance_id,
+            "viewer_url": self.viewer_url,
             "created_at": self.created_at.isoformat(timespec="milliseconds"),
             "last_activity_at": self.last_activity_at.isoformat(timespec="milliseconds"),
             "closed": self.closed,
@@ -267,12 +286,55 @@ class SessionRegistry:
     def __init__(self) -> None:
         self._sessions: dict[str, SshSession] = {}
         self._lock = threading.Lock()
+        self.server_instance_id = _make_server_instance_id()
+        self.started_at = datetime.now().astimezone()
+        self.viewer_base_url: str | None = None
 
-    def open(self, profile: SshProfile, *, password: str | None = None, passphrase: str | None = None) -> SshSession:
+    def set_viewer_base_url(self, base_url: str | None) -> None:
+        self.viewer_base_url = base_url.rstrip("/") if base_url else None
+
+    def session_url(self, session_id: str) -> str | None:
+        if not self.viewer_base_url:
+            return None
+        return f"{self.viewer_base_url}/sessions/{quote(session_id, safe='')}"
+
+    def server_info(self) -> dict[str, Any]:
+        return {
+            "server_instance_id": self.server_instance_id,
+            "pid": os.getpid(),
+            "cwd": str(Path.cwd()),
+            "started_at": self.started_at.isoformat(timespec="milliseconds"),
+            "viewer_base_url": self.viewer_base_url,
+        }
+
+    def open(
+        self,
+        profile: SshProfile,
+        *,
+        password: str | None = None,
+        passphrase: str | None = None,
+        owner_label: str | None = None,
+    ) -> SshSession:
         import paramiko
 
         session_id = _make_session_id(profile.name)
         transcript = TranscriptWriter(session_id)
+        viewer_url = self.session_url(session_id)
+        transcript.record(
+            "session_meta",
+            "session metadata",
+            extra={
+                "profile": profile.name,
+                "host": profile.host,
+                "port": profile.port,
+                "username": profile.username,
+                "owner_label": owner_label,
+                "server_instance_id": self.server_instance_id,
+                "pid": os.getpid(),
+                "cwd": str(Path.cwd()),
+                "viewer_url": viewer_url,
+            },
+        )
         client = paramiko.SSHClient()
         if profile.auto_add_host_key:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -300,7 +362,16 @@ class SessionRegistry:
             client.close()
             raise
 
-        session = SshSession(session_id, profile, client, channel, transcript)
+        session = SshSession(
+            session_id,
+            profile,
+            client,
+            channel,
+            transcript,
+            owner_label=owner_label,
+            server_instance_id=self.server_instance_id,
+            viewer_url=viewer_url,
+        )
         transcript.record("event", "session opened")
         with self._lock:
             self._sessions[session_id] = session
@@ -366,6 +437,11 @@ def _make_session_id(profile_name: str) -> str:
     safe_name = "".join(ch if ch in string.ascii_letters + string.digits + "-_" else "-" for ch in profile_name)
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     return f"{safe_name}-{timestamp}-{secrets.token_hex(3)}"
+
+
+def _make_server_instance_id() -> str:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return f"ssh-mcp-{timestamp}-{secrets.token_hex(4)}"
 
 
 def _load_private_key(profile: SshProfile, passphrase: str | None) -> Any:

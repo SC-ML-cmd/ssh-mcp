@@ -20,7 +20,7 @@ dev = [
 
 [project.scripts]
 ssh-mcp = "ssh_mcp.server:main"
+ssh-mcp-viewer = "ssh_mcp.viewer:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

@@ -125,3 +125,27 @@ lab/cmsm_simulator/
 ```
 
 它模拟 `CMSM 菜单 -> master shell -> kubectl exec -> pod shell` 的完整链路，并在 fake pod 内提供可搜索日志。部署和测试步骤见 [lab/cmsm_simulator/README.md](lab/cmsm_simulator/README.md)。
+
+## Product viewer
+
+`ssh-mcp` now starts a local browser viewer with the MCP server. The default bind address is `127.0.0.1`, and the default port mode is `auto`, starting near `8765`.
+
+```powershell
+python -m ssh_mcp.server --viewer-host 127.0.0.1 --viewer-port auto
+```
+
+Useful URLs:
+
+- `http://127.0.0.1:<port>/` lists known sessions.
+- `http://127.0.0.1:<port>/sessions/<session_id>` shows one session as a terminal-style page.
+- `open_session(...)` returns the exact `viewer_url` for the session.
+
+`open_session` accepts an optional `owner_label` value. Use it to bind the SSH session to the LLM tab or troubleshooting task that created it:
+
+```json
+{"profile": "lab", "owner_label": "claude-payment-debug"}
+```
+
+Each transcript starts with a `session_meta` event containing `session_id`, `profile`, `owner_label`, `server_instance_id`, process metadata, and `viewer_url`.
+
+Important: `send_text(..., sensitive=true)` no longer redacts transcript text. The `sensitive` flag is kept as metadata, but the raw input is written to JSONL and may appear in the viewer if it is part of the terminal stream. Protect the `transcripts/` directory accordingly.

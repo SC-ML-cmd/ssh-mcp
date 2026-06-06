@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import unittest
+import urllib.request
 
 from ssh_mcp.config import load_profile, load_profiles
-from ssh_mcp.session import TerminalBuffer, _key_classes_for_file, build_log_search_command
-from ssh_mcp.transcript import TranscriptWriter
+from ssh_mcp.session import SessionRegistry, TerminalBuffer, _key_classes_for_file, build_log_search_command
+from ssh_mcp.transcript import TranscriptWriter, list_transcript_summaries, read_events, render_terminal_delta
+from ssh_mcp.viewer import start_viewer_server
 
 
 class ConfigTests(unittest.TestCase):
@@ -93,10 +96,47 @@ class TranscriptTests(unittest.TestCase):
             writer.record("recv", "ok\n")
             events = writer.tail(10)
 
-        self.assertEqual(events[0]["text"], "[REDACTED]")
+        self.assertEqual(events[0]["text"], "password\n")
         self.assertTrue(events[0]["sensitive"])
         self.assertEqual(events[1]["dir"], "recv")
         self.assertEqual(events[1]["text"], "ok\n")
+
+    def test_reads_incremental_events_and_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = TranscriptWriter("session-1", temp_dir)
+            writer.record(
+                "session_meta",
+                "session metadata",
+                extra={"profile": "dev", "owner_label": "codex-test", "viewer_url": "http://127.0.0.1:8765/sessions/session-1"},
+            )
+            writer.record("recv", "ok\n")
+            events, last_line = read_events(writer.path, after_line=1)
+            summaries = list_transcript_summaries(temp_dir)
+
+        self.assertEqual(last_line, 2)
+        self.assertEqual(events[0]["dir"], "recv")
+        self.assertEqual(summaries[0]["session_id"], "session-1")
+        self.assertEqual(summaries[0]["owner_label"], "codex-test")
+
+    def test_terminal_renderer_hides_execute_command_marker_noise(self) -> None:
+        events = [
+            {
+                "dir": "send",
+                "text": "whoami\nprintf '\\n__SSH_MCP_DONE_abc123__:%s\\n' \"$?\"\n",
+                "tool": "execute_command",
+            },
+            {
+                "dir": "recv",
+                "text": "whoami\r\nroot\r\n[root@host ~]# printf '\\n__SSH_MCP_DONE_abc123__:%s\\n' \"$?\"\r\n\r\n__SSH_MCP_DONE_abc123__:0\r\n[root@host ~]# ",
+            },
+        ]
+
+        rendered = render_terminal_delta(events)
+
+        self.assertIn("whoami", rendered)
+        self.assertIn("root", rendered)
+        self.assertNotIn("__SSH_MCP_DONE", rendered)
+        self.assertNotIn("printf", rendered)
 
 
 class BufferTests(unittest.TestCase):
@@ -125,6 +165,40 @@ class SearchCommandTests(unittest.TestCase):
         self.assertIn("-C 2", command)
 
 
+class ViewerTests(unittest.TestCase):
+    def test_viewer_serves_sessions_and_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = TranscriptWriter("session-1", temp_dir)
+            writer.record("session_meta", "session metadata", extra={"profile": "dev", "owner_label": "codex-test"})
+            writer.record("recv", "hello\n")
+            registry = SessionRegistry()
+            viewer = start_viewer_server(registry, port="auto", transcripts_dir=temp_dir)
+            try:
+                sessions = _json_get(f"{viewer.base_url}/api/sessions")
+                events = _json_get(f"{viewer.base_url}/api/sessions/session-1/events?after_line=0&wait_ms=1")
+            finally:
+                viewer.shutdown()
+
+        session = next(item for item in sessions["sessions"] if item["session_id"] == "session-1")
+        self.assertTrue(sessions["ok"])
+        self.assertEqual(session["owner_label"], "codex-test")
+        self.assertTrue(events["ok"])
+        self.assertIn("hello", events["terminal_delta"])
+
+    def test_viewer_moves_to_next_port_when_requested_port_is_busy(self) -> None:
+        registry = SessionRegistry()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen(1)
+            busy_port = occupied.getsockname()[1]
+            viewer = start_viewer_server(registry, port=str(busy_port))
+            try:
+                self.assertNotEqual(viewer.port, busy_port)
+                self.assertEqual(registry.server_info()["viewer_base_url"], viewer.base_url)
+            finally:
+                viewer.shutdown()
+
+
 class KeyLoadingTests(unittest.TestCase):
     def test_rsa_pem_header_prefers_rsa_loader(self) -> None:
         class FakeParamiko:
@@ -143,6 +217,11 @@ class KeyLoadingTests(unittest.TestCase):
             key_classes = _key_classes_for_file(FakeParamiko, key_path)
 
         self.assertEqual(key_classes, [FakeParamiko.RSAKey])
+
+
+def _json_get(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 if __name__ == "__main__":

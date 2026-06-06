@@ -6,6 +6,8 @@
 
 - `open_session(profile, owner_label=None)`：按配置打开持久 SSH 会话，并返回对应的浏览器 `viewer_url`。
 - `list_sessions()`：查看当前 MCP Server 实例内的活动会话和运行时信息。
+- `close_session(session_id)`：关闭指定 SSH 会话。
+- `reopen_session(session_id)`：基于旧 session 的 profile 打开一个新的 SSH 登录，不重放菜单或命令。
 - `send_text(session_id, text, enter=True, wait_for="", timeout=30)`：向菜单或 shell 发送文本。
 - `execute_command(session_id, command, wait_for_prompt=True, timeout=30)`：在当前 shell 状态下执行命令。
 - `get_screen(session_id, lines=100)`：查看内存中最近的终端输出。
@@ -192,8 +194,11 @@ runtime/
 - 使用 Paramiko transport keepalive 保持 SSH 连接活跃。
 - 后台 health monitor 定期检查 transport/channel。
 - 断开后 session 会标记为 `unhealthy` 或 `closed`。
-- 后续 `send_text` / `execute_command` 返回可读错误。
+- 后续 `send_text` / `execute_command` 返回可读错误，并附带 `health_status`、`health_error`、`last_activity_at`、`last_heartbeat_at`、`transcript_path` 和 session 摘要。
+- `get_screen` 仍可查看断开前内存中的最后屏幕内容。
+- `reopen_session` 可以基于旧 session 的 profile 打开一个新的 SSH 登录，并在新旧 transcript 中记录关联信息。
 - 不自动重放 CMSM -> master -> pod 路径，避免误以为恢复了原始 shell 状态。
+- 不自动恢复到 pod，不自动重放最后一条命令，不伪装成原 shell 仍然存活。
 
 ## 本地 CMSM 测试环境
 

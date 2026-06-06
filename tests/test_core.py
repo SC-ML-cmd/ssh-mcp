@@ -12,7 +12,7 @@ import urllib.request
 from ssh_mcp.config import load_profile, load_profiles
 from ssh_mcp.log_config import configure_logging
 from ssh_mcp.runtime import build_runtime
-from ssh_mcp.session import SessionRegistry, TerminalBuffer, _key_classes_for_file, build_log_search_command
+from ssh_mcp.session import SessionRegistry, SshSession, TerminalBuffer, _key_classes_for_file, build_log_search_command
 from ssh_mcp.transcript import TranscriptWriter, list_transcript_summaries, read_events, render_terminal_delta
 from ssh_mcp.viewer import start_viewer_server
 
@@ -341,6 +341,7 @@ class HealthTests(unittest.TestCase):
             with self.assertLogs("ssh_mcp.session", level="WARNING") as captured:
                 ok = session.check_health_once()
             info = session.info()
+            events = session.transcript.tail(10)
         finally:
             _close_fake_session(session)
 
@@ -348,6 +349,96 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(info["health_status"], "unhealthy")
         self.assertIn("inactive", info["health_error"])
         self.assertIn("SSH transport is inactive", captured.output[0])
+        health_events = [event for event in events if event["dir"] == "session_health"]
+        self.assertEqual(health_events[0]["health_status"], "unhealthy")
+
+    def test_closed_session_error_info_includes_diagnostics(self) -> None:
+        session = _fake_session(transport_active=False)
+        try:
+            session.buffer.append("last screen\n")
+            session.check_health_once()
+            with self.assertRaisesRegex(Exception, "closed"):
+                session.send_text("pwd")
+            error = session.error_info("Session is closed.")
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(error["session_id"], "fake-session")
+        self.assertEqual(error["health_status"], "unhealthy")
+        self.assertIn("inactive", error["health_error"])
+        self.assertIn("last_activity_at", error)
+        self.assertIn("transcript_path", error)
+
+    def test_server_send_text_returns_closed_session_diagnostics(self) -> None:
+        import ssh_mcp.server as server_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="server-error-test"))
+            session = _fake_session(transport_active=False)
+            session.buffer.append("last screen\n")
+            session.check_health_once()
+            with registry._lock:
+                registry._sessions[session.id] = session
+            old_registry = server_module.registry
+            server_module.registry = registry
+            try:
+                response = server_module.send_text(session.id, "pwd")
+                command_response = server_module.execute_command(session.id, "pwd")
+                screen_response = server_module.get_screen(session.id)
+            finally:
+                server_module.registry = old_registry
+                registry.close_all()
+                session._test_temp_dir.cleanup()
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["session_id"], "fake-session")
+        self.assertEqual(response["health_status"], "unhealthy")
+        self.assertIn("transcript_path", response)
+        self.assertFalse(command_response["ok"])
+        self.assertEqual(command_response["health_status"], "unhealthy")
+        self.assertTrue(screen_response["ok"])
+        self.assertIn("last screen", screen_response["screen"])
+
+
+class ReopenTests(unittest.TestCase):
+    def test_registry_reopen_links_new_session_to_previous_session(self) -> None:
+        class FakeReopenRegistry(SessionRegistry):
+            def open(self, profile, **kwargs):  # type: ignore[override]
+                self.open_kwargs = kwargs
+                session = _fake_session(
+                    profile=profile,
+                    session_id="fake-reopened",
+                    previous_session_id=kwargs.get("previous_session_id"),
+                    previous_transcript_path=kwargs.get("previous_transcript_path"),
+                )
+                self.created_session = session
+                with self._lock:
+                    self._sessions[session.id] = session
+                return session
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = FakeReopenRegistry(_build_test_runtime(temp_dir, server_instance_id="reopen-test"))
+            previous = _fake_session(session_id="fake-previous", owner_label="debug-order")
+            try:
+                with registry._lock:
+                    registry._sessions[previous.id] = previous
+
+                reopened = registry.reopen(previous.id)
+
+                previous_events = previous.transcript.tail(10)
+                reopened_info = reopened.info()
+            finally:
+                registry.close_all()
+                previous._test_temp_dir.cleanup()
+                if hasattr(registry, "created_session"):
+                    registry.created_session._test_temp_dir.cleanup()
+
+        self.assertEqual(registry.open_kwargs["owner_label"], "debug-order")
+        self.assertEqual(registry.open_kwargs["previous_session_id"], "fake-previous")
+        self.assertEqual(reopened_info["previous_session_id"], "fake-previous")
+        self.assertEqual(reopened_info["previous_transcript_path"], str(previous.transcript.path))
+        self.assertTrue(any(event["text"] == "reopen requested" for event in previous_events))
+        self.assertTrue(any(event["text"] == "reopen succeeded" and event["new_session_id"] == "fake-reopened" for event in previous_events))
 
 
 class KeyLoadingTests(unittest.TestCase):
@@ -435,18 +526,29 @@ class _FakeChannel:
         self.closed = True
 
 
-def _fake_session(*, transport_active: bool = True):
+def _fake_session(
+    *,
+    transport_active: bool = True,
+    profile=None,
+    session_id: str = "fake-session",
+    owner_label: str | None = None,
+    previous_session_id: str | None = None,
+    previous_transcript_path: str | None = None,
+):
     from ssh_mcp.config import SshProfile
 
     temp_dir = tempfile.TemporaryDirectory()
-    profile = SshProfile(name="fake", host="127.0.0.1", username="fake", keepalive_interval=3600)
-    session = __import__("ssh_mcp.session", fromlist=["SshSession"]).SshSession(
-        "fake-session",
+    profile = profile or SshProfile(name="fake", host="127.0.0.1", username="fake", keepalive_interval=3600)
+    session = SshSession(
+        session_id,
         profile,
         _FakeClient(transport_active),
         _FakeChannel(),
-        TranscriptWriter("fake-session", temp_dir.name),
+        TranscriptWriter(session_id, temp_dir.name),
+        owner_label=owner_label,
         server_instance_id="server-health-test",
+        previous_session_id=previous_session_id,
+        previous_transcript_path=previous_transcript_path,
     )
     session._test_temp_dir = temp_dir
     return session

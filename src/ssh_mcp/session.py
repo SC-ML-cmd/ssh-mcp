@@ -108,6 +108,8 @@ class SshSession:
         owner_label: str | None = None,
         server_instance_id: str,
         viewer_url: str | None = None,
+        previous_session_id: str | None = None,
+        previous_transcript_path: str | None = None,
     ) -> None:
         self.id = session_id
         self.profile = profile
@@ -117,6 +119,8 @@ class SshSession:
         self.owner_label = owner_label
         self.server_instance_id = server_instance_id
         self.viewer_url = viewer_url
+        self.previous_session_id = previous_session_id
+        self.previous_transcript_path = previous_transcript_path
         self.buffer = TerminalBuffer()
         self.created_at = datetime.now().astimezone()
         self.last_activity_at = self.created_at
@@ -222,6 +226,8 @@ class SshSession:
             "owner_label": self.owner_label,
             "server_instance_id": self.server_instance_id,
             "viewer_url": self.viewer_url,
+            "previous_session_id": self.previous_session_id,
+            "previous_transcript_path": self.previous_transcript_path,
             "created_at": self.created_at.isoformat(timespec="milliseconds"),
             "last_activity_at": self.last_activity_at.isoformat(timespec="milliseconds"),
             "health_status": self.health_status,
@@ -232,6 +238,21 @@ class SshSession:
             "closed": self.closed,
             "read_error": self.read_error,
             "transcript_path": str(self.transcript.path),
+        }
+
+    def error_info(self, message: str) -> dict[str, Any]:
+        info = self.info()
+        return {
+            "error": message,
+            "session_id": self.id,
+            "health_status": info["health_status"],
+            "health_error": info["health_error"],
+            "last_activity_at": info["last_activity_at"],
+            "last_heartbeat_at": info["last_heartbeat_at"],
+            "closed": info["closed"],
+            "read_error": info["read_error"],
+            "transcript_path": info["transcript_path"],
+            "session": info,
         }
 
     def _reader_loop(self) -> None:
@@ -359,6 +380,9 @@ class SshSession:
         if self.closed:
             detail = f" {self.health_error}" if self.health_error else ""
             raise SessionError(f"Session '{self.id}' is closed.{detail}")
+        if not self.check_health_once():
+            detail = f" {self.health_error}" if self.health_error else ""
+            raise SessionError(f"Session '{self.id}' is closed.{detail}")
         self._raise_if_reader_failed()
 
     def _raise_if_reader_failed(self) -> None:
@@ -407,6 +431,8 @@ class SessionRegistry:
         password: str | None = None,
         passphrase: str | None = None,
         owner_label: str | None = None,
+        previous_session_id: str | None = None,
+        previous_transcript_path: str | None = None,
     ) -> SshSession:
         import paramiko
 
@@ -429,6 +455,8 @@ class SessionRegistry:
                 "cwd": str(Path.cwd()),
                 "instance_dir": str(self.runtime.instance_dir),
                 "viewer_url": viewer_url,
+                "previous_session_id": previous_session_id,
+                "previous_transcript_path": previous_transcript_path,
             },
         )
         client = paramiko.SSHClient()
@@ -470,12 +498,69 @@ class SessionRegistry:
             owner_label=owner_label,
             server_instance_id=self.server_instance_id,
             viewer_url=viewer_url,
+            previous_session_id=previous_session_id,
+            previous_transcript_path=previous_transcript_path,
         )
         transcript.record("event", "session opened")
+        if previous_session_id:
+            transcript.record(
+                "event",
+                "session reopened from previous session",
+                extra={
+                    "previous_session_id": previous_session_id,
+                    "previous_transcript_path": previous_transcript_path,
+                    "reopen_scope": "ssh-login-only",
+                },
+            )
         with self._lock:
             self._sessions[session_id] = session
         LOGGER.info("Opened SSH session", extra={"session_id": session_id, "owner_label": owner_label})
         return session
+
+    def reopen(
+        self,
+        session_id: str,
+        *,
+        password: str | None = None,
+        passphrase: str | None = None,
+    ) -> SshSession:
+        previous = self.get(session_id)
+        previous_info = previous.info()
+        previous.transcript.record(
+            "event",
+            "reopen requested",
+            extra={
+                "reopen_scope": "ssh-login-only",
+                "health_status": previous_info["health_status"],
+                "health_error": previous_info["health_error"],
+            },
+        )
+        try:
+            reopened = self.open(
+                previous.profile,
+                password=password,
+                passphrase=passphrase,
+                owner_label=previous.owner_label,
+                previous_session_id=previous.id,
+                previous_transcript_path=str(previous.transcript.path),
+            )
+            previous.transcript.record(
+                "event",
+                "reopen succeeded",
+                extra={
+                    "reopen_scope": "ssh-login-only",
+                    "new_session_id": reopened.id,
+                    "new_transcript_path": str(reopened.transcript.path),
+                },
+            )
+            return reopened
+        except Exception as exc:
+            previous.transcript.record(
+                "event",
+                "reopen failed",
+                extra={"reopen_scope": "ssh-login-only", "error": str(exc)},
+            )
+            raise
 
     def get(self, session_id: str) -> SshSession:
         with self._lock:

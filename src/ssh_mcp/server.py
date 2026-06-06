@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from .config import get_config_path, load_profile
 from .log_config import configure_logging
 from .runtime import build_runtime
-from .session import SessionRegistry, build_log_search_command
+from .session import SessionError, SessionRegistry, SshSession, build_log_search_command
 from .viewer import start_viewer_server, viewer_defaults_from_env
 
 
@@ -93,6 +93,32 @@ def close_session(session_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def reopen_session(
+    session_id: str,
+    password: str | None = None,
+    passphrase: str | None = None,
+) -> dict[str, Any]:
+    """Open a fresh SSH login using a previous session's profile; does not replay menus or commands."""
+    try:
+        previous = registry.get(session_id)
+        previous_info = previous.info()
+        session = registry.reopen(session_id, password=password, passphrase=passphrase)
+        return {
+            "ok": True,
+            "session": session.info(),
+            "viewer_url": session.viewer_url,
+            "previous_session": previous_info,
+            "previous_session_id": previous.id,
+            "previous_transcript_path": str(previous.transcript.path),
+            "reopen_scope": "ssh-login-only",
+            "note": "Opened a new SSH login only; CMSM/master/pod path and previous shell state were not replayed.",
+        }
+    except Exception as exc:
+        LOGGER.exception("reopen_session failed")
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
 def send_text(
     session_id: str,
     text: str,
@@ -112,9 +138,12 @@ def send_text(
             sensitive=sensitive,
         )
         return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
+    except SessionError as exc:
+        LOGGER.warning("send_text failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
     except Exception as exc:
         LOGGER.exception("send_text failed")
-        return {"ok": False, "error": str(exc)}
+        return _session_error_response(exc, session if "session" in locals() else None)
 
 
 @mcp.tool()
@@ -135,9 +164,12 @@ def execute_command(
             timeout=timeout,
         )
         return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
+    except SessionError as exc:
+        LOGGER.warning("execute_command failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
     except Exception as exc:
         LOGGER.exception("execute_command failed")
-        return {"ok": False, "error": str(exc)}
+        return _session_error_response(exc, session if "session" in locals() else None)
 
 
 @mcp.tool()
@@ -158,9 +190,12 @@ def interrupt(session_id: str) -> dict[str, Any]:
         session = registry.get(session_id)
         result = session.interrupt()
         return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
+    except SessionError as exc:
+        LOGGER.warning("interrupt failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
     except Exception as exc:
         LOGGER.exception("interrupt failed")
-        return {"ok": False, "error": str(exc)}
+        return _session_error_response(exc, session if "session" in locals() else None)
 
 
 @mcp.tool()
@@ -207,9 +242,18 @@ def search_logs(
             **result.as_dict(),
             "transcript_path": str(session.transcript.path),
         }
+    except SessionError as exc:
+        LOGGER.warning("search_logs failed: %s", exc)
+        return {**_session_error_response(exc, session if "session" in locals() else None), "command": command}
     except Exception as exc:
         LOGGER.exception("search_logs failed")
-        return {"ok": False, "error": str(exc), "command": command}
+        return {**_session_error_response(exc, session if "session" in locals() else None), "command": command}
+
+
+def _session_error_response(exc: Exception, session: SshSession | None) -> dict[str, Any]:
+    if not session:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": False, **session.error_info(str(exc))}
 
 
 def main(argv: list[str] | None = None) -> None:

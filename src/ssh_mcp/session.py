@@ -29,6 +29,8 @@ class SessionError(RuntimeError):
 
 
 class TerminalBuffer:
+    """保存最近一段 PTY 输出，并用绝对偏移支持增量读取。"""
+
     def __init__(self, max_chars: int = MAX_BUFFER_CHARS) -> None:
         self.max_chars = max_chars
         self._chunks: deque[str] = deque()
@@ -70,6 +72,7 @@ class TerminalBuffer:
             return time.monotonic() - self._last_append_at
 
     def _trim_locked(self) -> None:
+        # 输出量可能很大，只保留最近窗口；_dropped_chars 用来把旧绝对偏移映射回当前缓冲区。
         while self._chunks and sum(len(chunk) for chunk in self._chunks) > self.max_chars:
             dropped = self._chunks.popleft()
             self._dropped_chars += len(dropped)
@@ -92,6 +95,8 @@ class CommandResult:
 
 
 class SshSession:
+    """一个长期存活的交互式 SSH shell，会同时维护 reader、health 和 transcript。"""
+
     def __init__(
         self,
         session_id: str,
@@ -172,6 +177,7 @@ class SshSession:
 
         marker = f"__SSH_MCP_DONE_{secrets.token_hex(8)}__"
         marker_pattern = re.compile(rf"{re.escape(marker)}:(-?\d+)")
+        # 在远端 shell 里追加唯一 marker，用它判断命令结束并提取退出码。
         wrapped = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\""
         offset = self._send_payload(wrapped + "\n", tool="execute_command", sensitive=False)
         match = self._wait_for_regex(marker_pattern, offset, timeout)
@@ -229,6 +235,7 @@ class SshSession:
         }
 
     def _reader_loop(self) -> None:
+        # reader 线程只负责持续搬运 PTY 输出，所有发送动作由调用线程串行完成。
         while not self._stop_event.is_set():
             try:
                 if self.channel.recv_ready():
@@ -281,6 +288,7 @@ class SshSession:
         return True
 
     def _health_loop(self) -> None:
+        # health monitor 只探测连接状态，不尝试重连或重放 CMSM/master/pod 路径。
         interval = max(float(self.profile.keepalive_interval or 30.0), 1.0)
         while not self._stop_event.wait(interval):
             if not self.check_health_once():
@@ -359,6 +367,8 @@ class SshSession:
 
 
 class SessionRegistry:
+    """当前 MCP Server 进程内的 session 索引和 viewer URL 绑定。"""
+
     def __init__(self, runtime: ServerRuntime | None = None) -> None:
         self._sessions: dict[str, SshSession] = {}
         self._lock = threading.Lock()
@@ -403,6 +413,7 @@ class SessionRegistry:
         session_id = _make_session_id(profile.name)
         transcript = TranscriptWriter(session_id, self.runtime.transcripts_dir)
         viewer_url = self.session_url(session_id)
+        # 首行元数据用于把 session 和 MCP 实例、LLM 标签、人类用途标签稳定关联起来。
         transcript.record(
             "session_meta",
             "session metadata",
@@ -502,6 +513,8 @@ def build_log_search_command(
     ignore_case: bool = True,
     max_count: int = 200,
 ) -> str:
+    """生成可在远端当前 shell 中执行的 find/grep 日志搜索命令。"""
+
     flags = ["-n", "-I"]
     if ignore_case:
         flags.append("-i")

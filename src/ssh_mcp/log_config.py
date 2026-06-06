@@ -17,6 +17,8 @@ DEFAULT_LOG_FIELDS = {
 
 
 class ContextDefaultsFilter(logging.Filter):
+    """给所有日志记录补齐实例和会话字段，避免 formatter 因缺字段报错。"""
+
     def __init__(self, defaults: dict[str, Any]) -> None:
         super().__init__()
         self.defaults = defaults

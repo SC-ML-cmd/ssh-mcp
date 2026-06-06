@@ -39,6 +39,8 @@ class ViewerServer:
 
 
 class ViewerState:
+    """合并当前实例、活动 session 和旧 transcript，供只读 viewer 展示。"""
+
     def __init__(self, registry: SessionRegistry, transcripts_dir: str | Path | None = None) -> None:
         self.registry = registry
         self.transcripts_dir = get_transcripts_dir(transcripts_dir or registry.runtime.transcripts_dir)
@@ -47,6 +49,7 @@ class ViewerState:
     def sessions(self) -> list[dict[str, Any]]:
         by_id: dict[str, dict[str, Any]] = {}
 
+        # 当前实例目录是主数据源；旧 transcripts/ 只作为历史兼容入口。
         for session in list_transcript_summaries(self.transcripts_dir):
             session.setdefault("storage_scope", "instance")
             by_id[session["session_id"]] = session
@@ -61,6 +64,7 @@ class ViewerState:
         active_ids = {active["session_id"] for active in active_sessions}
 
         for active in active_sessions:
+            # 活动 session 的内存状态比历史 JSONL 摘要更新，优先覆盖。
             session_id = active["session_id"]
             current = by_id.get(session_id, {})
             current.update(active)
@@ -181,6 +185,7 @@ def _make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             events: list[dict[str, Any]] = []
             last_line = after_line
 
+            # 用长轮询降低刷新噪音；后续如果需要浏览器输入，可在这里升级 WebSocket。
             while True:
                 events, last_line = read_events(path, after_line=after_line, limit=limit)
                 if events or time.monotonic() >= deadline:
@@ -534,6 +539,8 @@ def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:
 
 
 def _is_safe_session_id(session_id: str) -> bool:
+    """限制 session_id 为文件名安全字符，避免通过 URL 读取任意路径。"""
+
     if not session_id or "/" in session_id or "\\" in session_id:
         return False
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")

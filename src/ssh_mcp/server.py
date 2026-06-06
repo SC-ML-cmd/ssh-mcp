@@ -17,6 +17,7 @@ from .viewer import start_viewer_server, viewer_defaults_from_env
 
 LOGGER = logging.getLogger(__name__)
 mcp = FastMCP("ssh-mcp")
+# FastMCP 装饰器在模块导入时绑定工具函数；main() 启动后会替换为带 runtime 的真实 registry。
 registry = SessionRegistry()
 
 
@@ -215,6 +216,7 @@ def main(argv: list[str] | None = None) -> None:
     global registry
 
     args = _parse_args(argv)
+    # 每个 MCP Server 进程独立生成 runtime，避免多个 LLM 同时启动时混写日志和 transcript。
     runtime = build_runtime(config_path=get_config_path())
     registry = SessionRegistry(runtime)
     log_path = configure_logging(

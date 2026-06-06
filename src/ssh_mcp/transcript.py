@@ -15,6 +15,8 @@ _DONE_MARKER_RE = re.compile(r"^.*__SSH_MCP_DONE_[0-9a-f]+__.*(?:\r?\n)?", re.MU
 
 
 class TranscriptWriter:
+    """线程安全地写入 JSONL 审计记录；sensitive 只做标记，不做脱敏。"""
+
     def __init__(self, session_id: str, base_dir: str | Path | None = None) -> None:
         self.session_id = session_id
         self.base_dir = Path(base_dir or os.getenv("SSH_MCP_TRANSCRIPTS_DIR") or DEFAULT_TRANSCRIPTS_DIR)
@@ -112,6 +114,8 @@ def list_transcript_summaries(base_dir: str | Path | None = None) -> list[dict[s
 
 
 def render_terminal_delta(events: list[dict[str, Any]]) -> str:
+    """把 JSONL 事件还原成终端视图，过滤 execute_command 的内部 marker 噪音。"""
+
     chunks: list[str] = []
     for index, event in enumerate(events):
         direction = event.get("dir")
@@ -138,6 +142,8 @@ def clean_terminal_text(text: str) -> str:
 
 
 def _summarize_transcript(path: Path) -> dict[str, Any] | None:
+    """从历史 JSONL 中提取 viewer 首页需要的轻量摘要。"""
+
     try:
         stat = path.stat()
         events, last_line = read_events(path, limit=10_000)

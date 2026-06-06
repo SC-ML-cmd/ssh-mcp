@@ -14,6 +14,8 @@ DEFAULT_RUNTIME_DIR = Path("runtime")
 
 @dataclass(frozen=True)
 class ServerRuntime:
+    """一次 MCP Server 进程对应的运行时目录和归属信息。"""
+
     server_instance_id: str
     client_label: str | None
     started_at: datetime
@@ -69,6 +71,8 @@ def build_runtime(
     client_label: str | None = None,
     config_path: str | Path | None = None,
 ) -> ServerRuntime:
+    """根据环境变量构造实例隔离的 runtime，并保留显式路径的兼容逻辑。"""
+
     instance_id = server_instance_id or make_server_instance_id()
     resolved_client_label = _optional_env_value(client_label) or _optional_env_value(os.getenv("SSH_MCP_CLIENT_LABEL"))
     runtime_dir = Path(os.getenv("SSH_MCP_RUNTIME_DIR") or DEFAULT_RUNTIME_DIR)
@@ -95,6 +99,8 @@ def build_runtime(
 
 
 def _optional_env_value(value: str | None) -> str | None:
+    """过滤空值和未展开的 ${...} 模板，避免把配置占位符当作真实值。"""
+
     if value is None:
         return None
     text = value.strip()

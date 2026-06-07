@@ -8,12 +8,13 @@ import socket
 import tempfile
 import unittest
 import urllib.request
+from datetime import datetime, timedelta
 
 from ssh_mcp.config import load_profile, load_profiles
 from ssh_mcp.log_config import configure_logging
 from ssh_mcp.runtime import build_runtime
 from ssh_mcp.security import REDACTED, SecurityPolicy
-from ssh_mcp.session import SessionRegistry, SshSession, TerminalBuffer, _key_classes_for_file, build_log_search_command
+from ssh_mcp.session import SessionRegistry, SessionError, SshSession, TerminalBuffer, _key_classes_for_file, build_log_search_command
 from ssh_mcp.transcript import TranscriptWriter, list_transcript_summaries, prune_transcripts, read_events, render_terminal_delta
 from ssh_mcp.viewer import start_viewer_server
 
@@ -280,6 +281,95 @@ class SecurityPolicyTests(unittest.TestCase):
         self.assertEqual(result.status, "running")
 
 
+class InputLockTests(unittest.TestCase):
+    def test_input_lock_blocks_other_actor_and_force_takes_over(self) -> None:
+        session = _fake_session()
+        try:
+            session.acquire_input_lock(actor="agent", ttl=30)
+            with self.assertRaisesRegex(SessionError, "Input lock is held"):
+                session.send_text("pwd", actor="human")
+
+            session.send_text("whoami", actor="human", force=True)
+            info = session.info()
+            events = session.transcript.tail(20)
+            sent_payloads = list(session.channel.sent_payloads)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(sent_payloads[-1], "whoami\n")
+        self.assertEqual(info["input_lock"]["actor"], "human")
+        self.assertTrue(any(event["dir"] == "input_lock_denied" and event["actor"] == "human" for event in events))
+        self.assertTrue(any(event["dir"] == "input_lock_takeover" and event["actor"] == "human" for event in events))
+
+    def test_send_text_records_actor_in_transcript(self) -> None:
+        session = _fake_session()
+        try:
+            session.send_text("pwd", actor="agent")
+            events = session.transcript.tail(20)
+        finally:
+            _close_fake_session(session)
+
+        send_events = [event for event in events if event["dir"] == "send"]
+        self.assertEqual(send_events[-1]["actor"], "agent")
+        self.assertEqual(send_events[-1]["tool"], "send_text")
+
+    def test_expired_input_lock_allows_new_actor(self) -> None:
+        session = _fake_session()
+        try:
+            session.acquire_input_lock(actor="agent", ttl=30)
+            session._input_lock.expires_at = datetime.now().astimezone() - timedelta(seconds=1)
+
+            session.send_text("pwd", actor="human")
+            info = session.input_lock_info()
+            sent_payloads = list(session.channel.sent_payloads)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(info["actor"], "human")
+        self.assertTrue(info["locked"])
+        self.assertEqual(sent_payloads[-1], "pwd\n")
+
+    def test_release_input_lock_requires_owner_or_force(self) -> None:
+        session = _fake_session()
+        try:
+            session.acquire_input_lock(actor="agent", ttl=30)
+            with self.assertRaisesRegex(SessionError, "use force=True"):
+                session.release_input_lock(actor="human")
+            released = session.release_input_lock(actor="human", force=True)
+            info = session.input_lock_info()
+        finally:
+            _close_fake_session(session)
+
+        self.assertTrue(released["released"])
+        self.assertFalse(info["locked"])
+
+    def test_server_input_lock_tools(self) -> None:
+        import ssh_mcp.server as server_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="server-lock-test"))
+            session = _fake_session()
+            with registry._lock:
+                registry._sessions[session.id] = session
+            old_registry = server_module.registry
+            server_module.registry = registry
+            try:
+                locked = server_module.acquire_input_lock(session.id, actor="agent", ttl=30)
+                status = server_module.input_lock_status(session.id)
+                denied = server_module.send_text(session.id, "pwd", actor="human")
+                released = server_module.release_input_lock(session.id, actor="agent")
+            finally:
+                server_module.registry = old_registry
+                registry.close_all()
+                session._test_temp_dir.cleanup()
+
+        self.assertTrue(locked["ok"])
+        self.assertEqual(status["input_lock"]["actor"], "agent")
+        self.assertFalse(denied["ok"])
+        self.assertIn("Input lock is held", denied["error"])
+        self.assertTrue(released["released"])
+
+
 class RuntimeTests(unittest.TestCase):
     def test_runtime_uses_instance_directories_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -355,6 +445,20 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(session["owner_label"], "codex-test")
         self.assertTrue(events["ok"])
         self.assertIn("hello", events["terminal_delta"])
+
+    def test_viewer_session_page_contains_input_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="viewer-controls-test"))
+            viewer = start_viewer_server(registry, port="auto")
+            try:
+                html = _text_get(f"{viewer.base_url}/sessions/session-1")
+            finally:
+                viewer.shutdown()
+
+        self.assertIn('id="input"', html)
+        self.assertIn('id="observer"', html)
+        self.assertIn('id="takeLock"', html)
+        self.assertIn('id="forceLock"', html)
 
     def test_viewer_moves_to_next_port_when_requested_port_is_busy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -433,6 +537,56 @@ class ViewerTests(unittest.TestCase):
         health = next(item for item in sessions["sessions"] if item["session_id"] == "health-history-1")
         self.assertEqual(health["status"], "unhealthy")
         self.assertEqual(health["health_error"], "SSH transport is inactive")
+
+    def test_viewer_input_endpoint_sends_human_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="viewer-input-test"))
+            session = _fake_session(session_id="viewer-input-session")
+            with registry._lock:
+                registry._sessions[session.id] = session
+            viewer = start_viewer_server(registry, port="auto")
+            try:
+                response = _json_post(
+                    f"{viewer.base_url}/api/sessions/{session.id}/input",
+                    {"text": "pwd", "enter": True, "actor": "human"},
+                )
+                events = session.transcript.tail(20)
+                sent_payloads = list(session.channel.sent_payloads)
+            finally:
+                viewer.shutdown()
+                registry.close_all()
+                session._test_temp_dir.cleanup()
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(sent_payloads[-1], "pwd\n")
+        self.assertEqual(response["input_lock"]["actor"], "human")
+        self.assertTrue(any(event["dir"] == "send" and event["actor"] == "human" for event in events))
+
+    def test_viewer_lock_endpoint_acquires_and_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="viewer-lock-test"))
+            session = _fake_session(session_id="viewer-lock-session")
+            with registry._lock:
+                registry._sessions[session.id] = session
+            viewer = start_viewer_server(registry, port="auto")
+            try:
+                locked = _json_post(
+                    f"{viewer.base_url}/api/sessions/{session.id}/lock",
+                    {"actor": "human", "ttl": 30},
+                )
+                unlocked = _json_post(
+                    f"{viewer.base_url}/api/sessions/{session.id}/unlock",
+                    {"actor": "human"},
+                )
+            finally:
+                viewer.shutdown()
+                registry.close_all()
+                session._test_temp_dir.cleanup()
+
+        self.assertTrue(locked["ok"])
+        self.assertEqual(locked["input_lock"]["actor"], "human")
+        self.assertTrue(unlocked["released"])
+        self.assertFalse(unlocked["input_lock"]["locked"])
 
 
 class HealthTests(unittest.TestCase):
@@ -659,6 +813,23 @@ class KeyLoadingTests(unittest.TestCase):
 
 def _json_get(url: str) -> dict:
     with urllib.request.urlopen(url, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _text_get(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.read().decode("utf-8")
+
+
+def _json_post(url: str, body: dict) -> dict:
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

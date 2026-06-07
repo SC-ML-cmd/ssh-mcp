@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import os
 from pathlib import Path
@@ -24,6 +24,7 @@ from .transcript import TranscriptWriter
 LOGGER = logging.getLogger(__name__)
 MAX_BUFFER_CHARS = 200_000
 MAX_COMMAND_OUTPUT_CHARS = 5_000_000
+DEFAULT_INPUT_LOCK_TTL = 60.0
 
 
 class SessionError(RuntimeError):
@@ -113,10 +114,12 @@ class TrackedCommand:
         marker_pattern: re.Pattern[str],
         start_offset: int,
         *,
+        actor: str = "agent",
         max_output_chars: int = MAX_COMMAND_OUTPUT_CHARS,
     ) -> None:
         self.command_id = command_id
         self.command = command
+        self.actor = actor
         self.marker = marker
         self.marker_pattern = marker_pattern
         self.start_offset = start_offset
@@ -195,6 +198,7 @@ class TrackedCommand:
         return {
             "command_id": self.command_id,
             "command": self.command,
+            "actor": self.actor,
             "status": self.status,
             "started_at": self.started_at.isoformat(timespec="milliseconds"),
             "updated_at": self.updated_at.isoformat(timespec="milliseconds"),
@@ -218,6 +222,31 @@ class TrackedCommand:
         while self._chunks and sum(len(chunk) for chunk in self._chunks) > self.max_output_chars:
             dropped = self._chunks.popleft()
             self._dropped_output_chars += len(dropped)
+
+
+@dataclass
+class InputLock:
+    actor: str
+    acquired_at: datetime
+    expires_at: datetime
+
+    def expired(self, now: datetime | None = None) -> bool:
+        return (now or datetime.now().astimezone()) >= self.expires_at
+
+    def refresh(self, ttl: float) -> None:
+        now = datetime.now().astimezone()
+        self.acquired_at = now
+        self.expires_at = now + timedelta(seconds=max(ttl, 1.0))
+
+    def info(self) -> dict[str, Any]:
+        now = datetime.now().astimezone()
+        return {
+            "actor": self.actor,
+            "acquired_at": self.acquired_at.isoformat(timespec="milliseconds"),
+            "expires_at": self.expires_at.isoformat(timespec="milliseconds"),
+            "expired": self.expired(now),
+            "ttl_remaining_seconds": max((self.expires_at - now).total_seconds(), 0.0),
+        }
 
 
 class SshSession:
@@ -259,6 +288,8 @@ class SshSession:
         self._write_lock = threading.Lock()
         self._health_lock = threading.Lock()
         self._command_lock = threading.Lock()
+        self._input_lock_guard = threading.Lock()
+        self._input_lock: InputLock | None = None
         self._commands: dict[str, TrackedCommand] = {}
         self._active_command_id: str | None = None
         self._health_event_recorded = False
@@ -280,14 +311,19 @@ class SshSession:
         timeout: float = 30.0,
         sensitive: bool = False,
         tool: str = "send_text",
+        actor: str = "agent",
+        lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+        force: bool = False,
     ) -> CommandResult:
+        actor = self._normalize_actor(actor)
         if tool not in {"cancel_command", "execute_command", "interrupt"}:
-            self._enforce_text_policy(text, tool=tool)
+            self._enforce_text_policy(text, tool=tool, actor=actor)
         self._ensure_open()
+        self._require_input_lock(actor=actor, ttl=lock_ttl, force=force)
         payload = text
         if enter and not payload.endswith("\n"):
             payload += "\n"
-        offset = self._send_payload(payload, tool=tool, sensitive=sensitive)
+        offset = self._send_payload(payload, tool=tool, sensitive=sensitive, actor=actor)
 
         if wait_for:
             timed_out = not self._wait_for(wait_for, offset, timeout)
@@ -305,14 +341,38 @@ class SshSession:
         wait_for_prompt: bool = True,
         timeout: float = 30.0,
         policy_tool: str = "execute_command",
+        actor: str = "agent",
+        lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+        force: bool = False,
     ) -> CommandResult:
-        self._enforce_command_policy(command, tool=policy_tool)
+        actor = self._normalize_actor(actor)
+        self._enforce_command_policy(command, tool=policy_tool, actor=actor)
         if wait_for:
-            return self.send_text(command, enter=True, wait_for=wait_for, timeout=timeout, tool="execute_command")
+            return self.send_text(
+                command,
+                enter=True,
+                wait_for=wait_for,
+                timeout=timeout,
+                tool="execute_command",
+                actor=actor,
+                lock_ttl=lock_ttl,
+                force=force,
+            )
         if not wait_for_prompt:
-            return self.send_text(command, enter=True, wait_for="", timeout=timeout, tool="execute_command")
+            return self.send_text(
+                command,
+                enter=True,
+                wait_for="",
+                timeout=timeout,
+                tool="execute_command",
+                actor=actor,
+                lock_ttl=lock_ttl,
+                force=force,
+            )
 
-        tracked = self._start_tracked_command(command)
+        self._ensure_open()
+        self._require_input_lock(actor=actor, ttl=lock_ttl, force=force)
+        tracked = self._start_tracked_command(command, actor=actor)
         completed = self._wait_for_command(tracked.command_id, timeout)
         info = tracked.info()
         timed_out = not completed and info["status"] in {"running", "cancel_requested"}
@@ -334,8 +394,23 @@ class SshSession:
             output_truncated=info["output_truncated"],
         )
 
-    def interrupt(self) -> CommandResult:
-        return self.send_text("\x03", enter=False, wait_for="", timeout=1.0, tool="interrupt")
+    def interrupt(
+        self,
+        *,
+        actor: str = "agent",
+        lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+        force: bool = False,
+    ) -> CommandResult:
+        return self.send_text(
+            "\x03",
+            enter=False,
+            wait_for="",
+            timeout=1.0,
+            tool="interrupt",
+            actor=actor,
+            lock_ttl=lock_ttl,
+            force=force,
+        )
 
     def get_command(self, command_id: str, *, output_limit: int | None = None) -> dict[str, Any]:
         with self._command_lock:
@@ -353,7 +428,17 @@ class SshSession:
             commands.sort(key=lambda item: item.started_at, reverse=True)
             return [command.info(output_limit=output_limit) for command in commands]
 
-    def cancel_command(self, command_id: str) -> CommandResult:
+    def cancel_command(
+        self,
+        command_id: str,
+        *,
+        actor: str = "agent",
+        lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+        force: bool = False,
+    ) -> CommandResult:
+        actor = self._normalize_actor(actor)
+        self._ensure_open()
+        self._require_input_lock(actor=actor, ttl=lock_ttl, force=force)
         with self._command_lock:
             command = self._commands.get(command_id)
             if not command:
@@ -373,12 +458,13 @@ class SshSession:
             self.transcript.record(
                 "command_cancel",
                 "Ctrl+C requested for tracked command",
-                extra=command.info(output_limit=0),
+                extra={**command.info(output_limit=0), "actor": actor},
             )
         self._send_payload(
             "\x03",
             tool="cancel_command",
             sensitive=False,
+            actor=actor,
             extra={"command_id": command_id},
         )
         info = self.get_command(command_id)
@@ -391,6 +477,78 @@ class SshSession:
             status=info["status"],
             output_truncated=info["output_truncated"],
         )
+
+    def input_lock_info(self) -> dict[str, Any]:
+        with self._input_lock_guard:
+            if not self._input_lock:
+                return {"locked": False, "actor": None, "expired": False, "ttl_remaining_seconds": 0.0}
+            info = self._input_lock.info()
+            return {"locked": not info["expired"], **info}
+
+    def acquire_input_lock(
+        self,
+        *,
+        actor: str = "agent",
+        ttl: float = DEFAULT_INPUT_LOCK_TTL,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+        return self._acquire_input_lock(
+            actor=self._normalize_actor(actor),
+            ttl=ttl,
+            force=force,
+            record_refresh=True,
+        )
+
+    def release_input_lock(
+        self,
+        *,
+        actor: str = "agent",
+        force: bool = False,
+    ) -> dict[str, Any]:
+        actor = self._normalize_actor(actor)
+        previous: dict[str, Any] | None = None
+        denied = False
+        with self._input_lock_guard:
+            if not self._input_lock:
+                input_lock = {"locked": False, "actor": None, "expired": False, "ttl_remaining_seconds": 0.0}
+                return {"released": False, "input_lock": input_lock}
+            now = datetime.now().astimezone()
+            if self._input_lock.expired(now):
+                previous = self._input_lock.info()
+                self._input_lock = None
+                released = False
+            elif self._input_lock.actor != actor and not force:
+                previous = self._input_lock.info()
+                denied = True
+                released = False
+            else:
+                previous = self._input_lock.info()
+                self._input_lock = None
+                released = True
+            input_lock = (
+                {"locked": False, "actor": None, "expired": False, "ttl_remaining_seconds": 0.0}
+                if self._input_lock is None
+                else {"locked": True, **self._input_lock.info()}
+            )
+
+        if denied:
+            self.transcript.record(
+                "input_lock_denied",
+                "input lock release denied",
+                extra={"actor": actor, "requested_action": "release", "current_lock": previous},
+            )
+            raise SessionError(
+                f"Input lock is held by '{previous.get('actor') if previous else 'unknown'}'; "
+                "use force=True to release it."
+            )
+
+        self.transcript.record(
+            "input_lock_released",
+            "input lock released",
+            extra={"actor": actor, "force": force, "released": released, "previous_lock": previous},
+        )
+        return {"released": released, "input_lock": input_lock, "previous_lock": previous}
 
     def screen(self, lines: int = 100) -> str:
         return self.buffer.last_lines(lines)
@@ -409,6 +567,7 @@ class SshSession:
             self.client.close()
         except Exception:
             LOGGER.exception("Failed to close SSH client for %s", self.id)
+        self._clear_input_lock()
         self.health_status = "closed"
         self.transcript.record("event", "session closed")
 
@@ -436,6 +595,7 @@ class SshSession:
             "transcript_path": str(self.transcript.path),
             "active_command_id": self._active_command_id,
             "commands": self.list_commands(output_limit=0),
+            "input_lock": self.input_lock_info(),
             "security": {
                 "mode": self.profile.security.mode,
                 "redact_transcripts": self.profile.security.redact_transcripts,
@@ -459,6 +619,82 @@ class SshSession:
             "session": info,
         }
 
+    def _normalize_actor(self, actor: str | None) -> str:
+        normalized = (actor or "agent").strip()
+        if not normalized:
+            normalized = "agent"
+        if len(normalized) > 64 or any(ch in normalized for ch in "\r\n\t"):
+            raise SessionError("Invalid actor label.")
+        return normalized
+
+    def _normalize_lock_ttl(self, ttl: float) -> float:
+        try:
+            value = float(ttl)
+        except (TypeError, ValueError) as exc:
+            raise SessionError("Invalid input lock ttl.") from exc
+        return min(max(value, 1.0), 3600.0)
+
+    def _require_input_lock(self, *, actor: str, ttl: float, force: bool) -> dict[str, Any]:
+        return self._acquire_input_lock(actor=actor, ttl=ttl, force=force, record_refresh=False)
+
+    def _acquire_input_lock(
+        self,
+        *,
+        actor: str,
+        ttl: float,
+        force: bool,
+        record_refresh: bool,
+    ) -> dict[str, Any]:
+        ttl = self._normalize_lock_ttl(ttl)
+        now = datetime.now().astimezone()
+        expires_at = now + timedelta(seconds=ttl)
+        previous: dict[str, Any] | None = None
+        event_dir = "input_lock_acquired"
+        should_record = True
+
+        with self._input_lock_guard:
+            current = self._input_lock
+            if current and not current.expired(now):
+                previous = current.info()
+                if current.actor == actor:
+                    current.refresh(ttl)
+                    info = {"locked": True, **current.info()}
+                    event_dir = "input_lock_refreshed"
+                    should_record = record_refresh
+                elif force:
+                    self._input_lock = InputLock(actor=actor, acquired_at=now, expires_at=expires_at)
+                    info = {"locked": True, **self._input_lock.info()}
+                    event_dir = "input_lock_takeover"
+                else:
+                    info = {"locked": True, **current.info()}
+                    denied_extra = {
+                        "actor": actor,
+                        "requested_action": "acquire",
+                        "force": force,
+                        "current_lock": previous,
+                    }
+                    self.transcript.record("input_lock_denied", "input lock acquire denied", extra=denied_extra)
+                    raise SessionError(
+                        f"Input lock is held by '{current.actor}' until "
+                        f"{current.expires_at.isoformat(timespec='milliseconds')}; use force=True to take over."
+                    )
+            else:
+                previous = current.info() if current else None
+                self._input_lock = InputLock(actor=actor, acquired_at=now, expires_at=expires_at)
+                info = {"locked": True, **self._input_lock.info()}
+
+        if should_record:
+            self.transcript.record(
+                event_dir,
+                "input lock acquired",
+                extra={"actor": actor, "force": force, "ttl_seconds": ttl, "input_lock": info, "previous_lock": previous},
+            )
+        return {"input_lock": info, "previous_lock": previous}
+
+    def _clear_input_lock(self) -> None:
+        with self._input_lock_guard:
+            self._input_lock = None
+
     def _reader_loop(self) -> None:
         # reader 线程只负责持续搬运 PTY 输出，所有发送动作由调用线程串行完成。
         while not self._stop_event.is_set():
@@ -481,6 +717,7 @@ class SshSession:
         if not self._stop_event.is_set() and self.health_status == "healthy":
             self._mark_unhealthy("SSH reader loop ended", status="closed")
         else:
+            self._clear_input_lock()
             self.closed = True
             if self.health_status == "healthy":
                 self.health_status = "closed"
@@ -530,6 +767,7 @@ class SshSession:
 
         self.closed = True
         self._stop_event.set()
+        self._clear_input_lock()
         self._mark_active_command_failed(message, status="session_closed")
         if first_record:
             self.transcript.record("session_health", message, extra={"health_status": status, "health_error": message})
@@ -545,6 +783,7 @@ class SshSession:
         *,
         tool: str,
         sensitive: bool,
+        actor: str,
         extra: dict[str, Any] | None = None,
     ) -> int:
         self._ensure_open()
@@ -552,34 +791,36 @@ class SshSession:
         with self._write_lock:
             self.channel.send(payload)
             self.last_activity_at = datetime.now().astimezone()
-            self.transcript.record("send", payload, tool=tool, sensitive=sensitive, extra=extra)
+            event_extra = {"actor": actor, **(extra or {})}
+            self.transcript.record("send", payload, tool=tool, sensitive=sensitive, extra=event_extra)
         return offset
 
-    def _enforce_command_policy(self, command: str, *, tool: str) -> None:
+    def _enforce_command_policy(self, command: str, *, tool: str, actor: str) -> None:
         decision = self.profile.security.evaluate_command(command, tool=tool)
         if not decision.allowed:
-            self._record_security_block("command", command, decision, tool=tool)
+            self._record_security_block("command", command, decision, tool=tool, actor=actor)
             raise SessionError(f"Security policy blocked {tool}: {decision.reason}")
 
-    def _enforce_text_policy(self, text: str, *, tool: str) -> None:
+    def _enforce_text_policy(self, text: str, *, tool: str, actor: str) -> None:
         decision = self.profile.security.evaluate_text(text, tool=tool)
         if not decision.allowed:
-            self._record_security_block("text", text, decision, tool=tool)
+            self._record_security_block("text", text, decision, tool=tool, actor=actor)
             raise SessionError(f"Security policy blocked {tool}: {decision.reason}")
 
-    def _record_security_block(self, kind: str, text: str, decision: SecurityDecision, *, tool: str) -> None:
+    def _record_security_block(self, kind: str, text: str, decision: SecurityDecision, *, tool: str, actor: str) -> None:
         self.transcript.record(
             "security_block",
             f"blocked {kind}",
             tool=tool,
             extra={
+                "actor": actor,
                 "blocked_kind": kind,
                 "blocked_text": text,
                 "security": decision.as_dict(),
             },
         )
 
-    def _start_tracked_command(self, command: str) -> TrackedCommand:
+    def _start_tracked_command(self, command: str, *, actor: str) -> TrackedCommand:
         self._ensure_open()
         with self._command_lock:
             if self._active_command_id:
@@ -595,14 +836,14 @@ class SshSession:
             marker = f"__SSH_MCP_DONE_{command_id}__"
             marker_pattern = re.compile(rf"{re.escape(marker)}:(-?\d+)")
             offset, _ = self.buffer.snapshot()
-            tracked = TrackedCommand(command_id, command, marker, marker_pattern, offset)
+            tracked = TrackedCommand(command_id, command, marker, marker_pattern, offset, actor=actor)
             self._commands[command_id] = tracked
             self._active_command_id = command_id
 
         self.transcript.record(
             "command_start",
             "tracked command started",
-            extra=tracked.info(output_limit=0),
+            extra={**tracked.info(output_limit=0), "actor": actor},
         )
         wrapped = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\""
         try:
@@ -610,6 +851,7 @@ class SshSession:
                 wrapped + "\n",
                 tool="execute_command",
                 sensitive=False,
+                actor=actor,
                 extra={"command_id": command_id, "command_marker": marker},
             )
         except Exception:

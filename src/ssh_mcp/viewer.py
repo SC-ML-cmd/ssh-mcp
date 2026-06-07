@@ -14,7 +14,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .session import SessionRegistry
+from .session import DEFAULT_INPUT_LOCK_TTL, SessionError, SessionRegistry
 from .transcript import DEFAULT_TRANSCRIPTS_DIR, get_transcripts_dir, list_transcript_summaries, read_events, render_terminal_delta
 
 
@@ -168,8 +168,126 @@ def _make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 except CLIENT_DISCONNECT_ERRORS:
                     LOGGER.debug("Viewer client disconnected before error response completed")
 
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            parts = parsed.path.strip("/").split("/")
+            try:
+                if len(parts) != 4 or parts[0] != "api" or parts[1] != "sessions":
+                    self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
+                    return
+
+                session_id = unquote(parts[2])
+                action = parts[3]
+                if not _is_safe_session_id(session_id):
+                    self._send_error(HTTPStatus.BAD_REQUEST, "Invalid session id.")
+                    return
+                try:
+                    body = self._read_json_body()
+                except ValueError as exc:
+                    self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
+
+                if action == "input":
+                    self._handle_input(session_id, body)
+                elif action == "lock":
+                    self._handle_lock(session_id, body, acquire=True)
+                elif action == "unlock":
+                    self._handle_lock(session_id, body, acquire=False)
+                else:
+                    self._send_error(HTTPStatus.NOT_FOUND, "Not found.")
+            except CLIENT_DISCONNECT_ERRORS:
+                LOGGER.debug("Viewer client disconnected before response completed")
+            except Exception as exc:  # pragma: no cover - protects the viewer loop
+                LOGGER.exception("Viewer POST failed")
+                try:
+                    self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+                except CLIENT_DISCONNECT_ERRORS:
+                    LOGGER.debug("Viewer client disconnected before error response completed")
+
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             LOGGER.debug("viewer %s - %s", self.address_string(), format % args)
+
+        def _read_json_body(self) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError as exc:
+                raise ValueError("Invalid Content-Length.") from exc
+            if length <= 0:
+                return {}
+            if length > 65_536:
+                raise ValueError("Request body is too large.")
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("Request body must be JSON.") from exc
+            if not isinstance(body, dict):
+                raise ValueError("Request body must be a JSON object.")
+            return body
+
+        def _active_session(self, session_id: str):
+            try:
+                return state.registry.get(session_id)
+            except SessionError as exc:
+                self._send_error(HTTPStatus.NOT_FOUND, f"Session is not active: {exc}")
+                return None
+
+        def _handle_input(self, session_id: str, body: dict[str, Any]) -> None:
+            session = self._active_session(session_id)
+            if not session:
+                return
+            actor = str(body.get("actor") or "human")
+            try:
+                result = session.send_text(
+                    str(body.get("text") or ""),
+                    enter=_bool_value(body.get("enter"), True),
+                    timeout=_float_value(body.get("timeout"), 0.2),
+                    sensitive=_bool_value(body.get("sensitive"), False),
+                    actor=actor,
+                    lock_ttl=_float_value(body.get("lock_ttl"), DEFAULT_INPUT_LOCK_TTL),
+                    force=_bool_value(body.get("force"), False),
+                )
+            except SessionError as exc:
+                self._send_json({"ok": False, **session.error_info(str(exc))}, status=HTTPStatus.CONFLICT)
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    **result.as_dict(),
+                    "session": session.info(),
+                    "input_lock": session.input_lock_info(),
+                    "transcript_path": str(session.transcript.path),
+                }
+            )
+
+        def _handle_lock(self, session_id: str, body: dict[str, Any], *, acquire: bool) -> None:
+            session = self._active_session(session_id)
+            if not session:
+                return
+            actor = str(body.get("actor") or "human")
+            try:
+                if acquire:
+                    result = session.acquire_input_lock(
+                        actor=actor,
+                        ttl=_float_value(body.get("ttl"), DEFAULT_INPUT_LOCK_TTL),
+                        force=_bool_value(body.get("force"), False),
+                    )
+                else:
+                    result = session.release_input_lock(
+                        actor=actor,
+                        force=_bool_value(body.get("force"), False),
+                    )
+            except SessionError as exc:
+                self._send_json({"ok": False, **session.error_info(str(exc))}, status=HTTPStatus.CONFLICT)
+                return
+            self._send_json(
+                {
+                    "ok": True,
+                    **result,
+                    "session": session.info(),
+                    "transcript_path": str(session.transcript.path),
+                }
+            )
 
         def _handle_events(self, session_id: str, query: str) -> None:
             if not _is_safe_session_id(session_id):
@@ -409,7 +527,7 @@ def _session_html(session_id: str) -> str:
       margin: 0;
       height: 100vh;
       display: grid;
-      grid-template-rows: auto 1fr;
+      grid-template-rows: auto minmax(0, 1fr) auto;
       background: var(--bg);
       color: var(--text);
       font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -445,10 +563,90 @@ def _session_html(session_id: str) -> str:
       word-break: break-word;
       tab-size: 4;
     }}
+    footer {{
+      display: grid;
+      grid-template-columns: minmax(110px, 160px) auto minmax(150px, 220px) auto minmax(220px, 1fr) auto minmax(140px, 1fr);
+      gap: 8px;
+      align-items: center;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+    }}
+    input, textarea, button, label {{
+      font: inherit;
+    }}
+    input, textarea {{
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #05070a;
+      color: var(--text);
+      outline: none;
+    }}
+    input:focus, textarea:focus {{
+      border-color: var(--accent);
+    }}
+    #actor {{
+      height: 34px;
+      padding: 0 9px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }}
+    #input {{
+      width: 100%;
+      height: 36px;
+      max-height: 120px;
+      resize: vertical;
+      padding: 7px 9px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }}
+    button {{
+      height: 34px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #151b23;
+      color: var(--text);
+      cursor: pointer;
+    }}
+    button:hover:not(:disabled) {{
+      border-color: var(--accent);
+    }}
+    button:disabled, textarea:disabled, input:disabled {{
+      cursor: not-allowed;
+      opacity: 0.55;
+    }}
+    .toggle {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      white-space: nowrap;
+      font-size: 12px;
+    }}
+    #lockStatus {{
+      min-width: 170px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    #message {{
+      min-height: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
     @media (max-width: 760px) {{
       header {{ grid-template-columns: 1fr auto; }}
       header > a {{ display: none; }}
       .meta {{ display: none; }}
+      footer {{ grid-template-columns: 1fr auto auto; }}
+      #lockStatus, #message {{ grid-column: 1 / -1; }}
+      #input {{ grid-column: 1 / -1; }}
     }}
   </style>
 </head>
@@ -462,25 +660,125 @@ def _session_html(session_id: str) -> str:
     <span id="status" class="status">history</span>
   </header>
   <pre id="terminal"></pre>
+  <footer>
+    <input id="actor" value="human" aria-label="Actor">
+    <label class="toggle"><input id="observer" type="checkbox">Observer</label>
+    <span id="lockStatus">unlocked</span>
+    <span>
+      <button id="takeLock" title="Acquire input lock">Take</button>
+      <button id="forceLock" title="Force takeover">Force</button>
+      <button id="releaseLock" title="Release input lock">Release</button>
+    </span>
+    <textarea id="input" spellcheck="false" aria-label="Terminal input"></textarea>
+    <span>
+      <label class="toggle"><input id="enter" type="checkbox" checked>Enter</label>
+      <button id="send" title="Send input">Send</button>
+    </span>
+    <span id="message"></span>
+  </footer>
   <script>
     const SESSION_ID = {encoded};
     const terminal = document.getElementById("terminal");
     const title = document.getElementById("title");
     const meta = document.getElementById("meta");
     const statusNode = document.getElementById("status");
+    const actorInput = document.getElementById("actor");
+    const observerInput = document.getElementById("observer");
+    const lockStatus = document.getElementById("lockStatus");
+    const takeLockButton = document.getElementById("takeLock");
+    const forceLockButton = document.getElementById("forceLock");
+    const releaseLockButton = document.getElementById("releaseLock");
+    const inputNode = document.getElementById("input");
+    const enterInput = document.getElementById("enter");
+    const sendButton = document.getElementById("send");
+    const messageNode = document.getElementById("message");
     let afterLine = 0;
     let polling = false;
+    let currentSession = null;
 
     function shouldStick() {{
       return terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 48;
     }}
 
+    function actor() {{
+      return actorInput.value.trim() || "human";
+    }}
+
+    function setMessage(text, error = false) {{
+      messageNode.textContent = text || "";
+      messageNode.style.color = error ? "var(--closed)" : "var(--muted)";
+    }}
+
+    function updateControls(session) {{
+      const isOpen = session && session.status === "open" && !session.closed;
+      const observing = observerInput.checked;
+      const lock = session && session.input_lock ? session.input_lock : null;
+      if (lock && lock.locked) {{
+        const ttl = Math.max(Math.ceil(lock.ttl_remaining_seconds || 0), 0);
+        lockStatus.textContent = `locked:${{lock.actor || "unknown"}} ${{ttl}}s`;
+      }} else {{
+        lockStatus.textContent = "unlocked";
+      }}
+      inputNode.disabled = observing || !isOpen;
+      sendButton.disabled = observing || !isOpen;
+      takeLockButton.disabled = observing || !isOpen;
+      forceLockButton.disabled = observing || !isOpen;
+      releaseLockButton.disabled = observing || !isOpen;
+    }}
+
     function updateSession(session) {{
       if (!session) return;
+      currentSession = session;
       title.textContent = session.owner_label || session.session_id;
       meta.textContent = [session.session_id, session.profile, session.last_activity_at || session.updated_at].filter(Boolean).join("  ");
       statusNode.textContent = session.status || "history";
       statusNode.className = "status " + (session.status || "history");
+      updateControls(session);
+    }}
+
+    async function postJSON(path, body) {{
+      const response = await fetch(path, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(body),
+        cache: "no-store"
+      }});
+      const payload = await response.json();
+      if (!payload.ok) {{
+        throw new Error(payload.error || "request failed");
+      }}
+      updateSession(payload.session);
+      return payload;
+    }}
+
+    async function lockAction(action, force = false) {{
+      setMessage("");
+      try {{
+        const path = `/api/sessions/${{encodeURIComponent(SESSION_ID)}}/${{action}}`;
+        await postJSON(path, {{ actor: actor(), ttl: 60, force }});
+      }} catch (error) {{
+        setMessage(String(error.message || error), true);
+      }}
+    }}
+
+    async function sendInput() {{
+      if (observerInput.checked || !currentSession || currentSession.status !== "open") return;
+      const text = inputNode.value;
+      if (!text && !enterInput.checked) return;
+      setMessage("");
+      try {{
+        await postJSON(`/api/sessions/${{encodeURIComponent(SESSION_ID)}}/input`, {{
+          text,
+          enter: enterInput.checked,
+          actor: actor(),
+          lock_ttl: 60,
+          force: false
+        }});
+        inputNode.value = "";
+        inputNode.focus();
+      }} catch (error) {{
+        setMessage(String(error.message || error), true);
+      }}
     }}
 
     async function poll() {{
@@ -509,6 +807,18 @@ def _session_html(session_id: str) -> str:
       }}
     }}
 
+    observerInput.addEventListener("change", () => updateControls(currentSession));
+    takeLockButton.addEventListener("click", () => lockAction("lock", false));
+    forceLockButton.addEventListener("click", () => lockAction("lock", true));
+    releaseLockButton.addEventListener("click", () => lockAction("unlock", false));
+    sendButton.addEventListener("click", sendInput);
+    inputNode.addEventListener("keydown", event => {{
+      if (event.key === "Enter" && !event.shiftKey) {{
+        event.preventDefault();
+        sendInput();
+      }}
+    }});
+    updateControls(null);
     poll();
   </script>
 </body>
@@ -529,6 +839,30 @@ def _bindable_port(host: str, port: str | int) -> int:
                 continue
             return candidate
     raise OSError(f"No free viewer port found near {start}.")
+
+
+def _bool_value(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _float_value(value: Any, default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _int_param(params: dict[str, list[str]], name: str, default: int) -> int:

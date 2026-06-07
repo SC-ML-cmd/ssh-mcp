@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from .config import get_config_path, load_profile
 from .log_config import configure_logging
 from .runtime import build_runtime
-from .session import SessionError, SessionRegistry, SshSession, build_log_search_command
+from .session import DEFAULT_INPUT_LOCK_TTL, SessionError, SessionRegistry, SshSession, build_log_search_command
 from .viewer import start_viewer_server, viewer_defaults_from_env
 
 
@@ -135,6 +135,9 @@ def send_text(
     wait_for: str = "",
     timeout: float = 30.0,
     sensitive: bool = False,
+    actor: str = "agent",
+    lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Send raw text to the current interactive shell or menu."""
     try:
@@ -145,6 +148,9 @@ def send_text(
             wait_for=wait_for,
             timeout=timeout,
             sensitive=sensitive,
+            actor=actor,
+            lock_ttl=lock_ttl,
+            force=force,
         )
         return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
     except SessionError as exc:
@@ -162,6 +168,9 @@ def execute_command(
     wait_for: str = "",
     wait_for_prompt: bool = True,
     timeout: float = 30.0,
+    actor: str = "agent",
+    lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Run a shell command inside the current session state."""
     try:
@@ -171,6 +180,9 @@ def execute_command(
             wait_for=wait_for,
             wait_for_prompt=wait_for_prompt,
             timeout=timeout,
+            actor=actor,
+            lock_ttl=lock_ttl,
+            force=force,
         )
         return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
     except SessionError as exc:
@@ -218,11 +230,17 @@ def list_commands(session_id: str, output_limit: int = 0) -> dict[str, Any]:
 
 
 @mcp.tool()
-def cancel_command(session_id: str, command_id: str) -> dict[str, Any]:
+def cancel_command(
+    session_id: str,
+    command_id: str,
+    actor: str = "agent",
+    lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+    force: bool = False,
+) -> dict[str, Any]:
     """Send Ctrl+C for a running tracked command."""
     try:
         session = registry.get(session_id)
-        result = session.cancel_command(command_id)
+        result = session.cancel_command(command_id, actor=actor, lock_ttl=lock_ttl, force=force)
         return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
     except SessionError as exc:
         LOGGER.warning("cancel_command failed: %s", exc)
@@ -244,17 +262,72 @@ def get_screen(session_id: str, lines: int = 100) -> dict[str, Any]:
 
 
 @mcp.tool()
-def interrupt(session_id: str) -> dict[str, Any]:
+def interrupt(
+    session_id: str,
+    actor: str = "agent",
+    lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+    force: bool = False,
+) -> dict[str, Any]:
     """Send Ctrl+C to the session."""
     try:
         session = registry.get(session_id)
-        result = session.interrupt()
+        result = session.interrupt(actor=actor, lock_ttl=lock_ttl, force=force)
         return {"ok": True, **result.as_dict(), "transcript_path": str(session.transcript.path)}
     except SessionError as exc:
         LOGGER.warning("interrupt failed: %s", exc)
         return _session_error_response(exc, session if "session" in locals() else None)
     except Exception as exc:
         LOGGER.exception("interrupt failed")
+        return _session_error_response(exc, session if "session" in locals() else None)
+
+
+@mcp.tool()
+def input_lock_status(session_id: str) -> dict[str, Any]:
+    """Return the current input lock state for a session."""
+    try:
+        session = registry.get(session_id)
+        return {"ok": True, "input_lock": session.input_lock_info(), "session": session.info()}
+    except Exception as exc:
+        LOGGER.exception("input_lock_status failed")
+        return _session_error_response(exc, session if "session" in locals() else None)
+
+
+@mcp.tool()
+def acquire_input_lock(
+    session_id: str,
+    actor: str = "agent",
+    ttl: float = DEFAULT_INPUT_LOCK_TTL,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Acquire or refresh the input lock before sending terminal input."""
+    try:
+        session = registry.get(session_id)
+        result = session.acquire_input_lock(actor=actor, ttl=ttl, force=force)
+        return {"ok": True, **result, "session": session.info(), "transcript_path": str(session.transcript.path)}
+    except SessionError as exc:
+        LOGGER.warning("acquire_input_lock failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
+    except Exception as exc:
+        LOGGER.exception("acquire_input_lock failed")
+        return _session_error_response(exc, session if "session" in locals() else None)
+
+
+@mcp.tool()
+def release_input_lock(
+    session_id: str,
+    actor: str = "agent",
+    force: bool = False,
+) -> dict[str, Any]:
+    """Release the input lock for the owning actor, or force release it."""
+    try:
+        session = registry.get(session_id)
+        result = session.release_input_lock(actor=actor, force=force)
+        return {"ok": True, **result, "session": session.info(), "transcript_path": str(session.transcript.path)}
+    except SessionError as exc:
+        LOGGER.warning("release_input_lock failed: %s", exc)
+        return _session_error_response(exc, session if "session" in locals() else None)
+    except Exception as exc:
+        LOGGER.exception("release_input_lock failed")
         return _session_error_response(exc, session if "session" in locals() else None)
 
 
@@ -283,6 +356,9 @@ def search_logs(
     ignore_case: bool = True,
     max_count: int = 200,
     timeout: float = 30.0,
+    actor: str = "tool",
+    lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Search log files from the current remote shell state."""
     command = build_log_search_command(
@@ -295,7 +371,14 @@ def search_logs(
     )
     try:
         session = registry.get(session_id)
-        result = session.execute_command(command, timeout=timeout, policy_tool="search_logs")
+        result = session.execute_command(
+            command,
+            timeout=timeout,
+            policy_tool="search_logs",
+            actor=actor,
+            lock_ttl=lock_ttl,
+            force=force,
+        )
         return {
             "ok": True,
             "command": command,

@@ -9,6 +9,9 @@
 - `close_session(session_id)`：关闭指定 SSH 会话。
 - `reopen_session(session_id)`：基于旧 session 的 profile 打开一个新的 SSH 登录，不重放菜单或命令。
 - `send_text(session_id, text, enter=True, wait_for="", timeout=30)`：向菜单或 shell 发送文本。
+- `input_lock_status(session_id)`：查看当前输入锁归属、过期时间和剩余 TTL。
+- `acquire_input_lock(session_id, actor="agent", ttl=60, force=False)`：为 Agent、人类或工具占用输入权。
+- `release_input_lock(session_id, actor="agent", force=False)`：释放输入锁；必要时可强制释放。
 - `execute_command(session_id, command, wait_for_prompt=True, timeout=30)`：在当前 shell 状态下执行命令。
 - `get_command(session_id, command_id)`：查询已跟踪命令的状态、退出码和已收集输出。
 - `list_commands(session_id)`：查看当前 session 的命令历史。
@@ -146,6 +149,26 @@ MCP Server 启动时会同时启动本地 viewer。默认从 `8765` 附近自动
 .\.venv\Scripts\python.exe -m ssh_mcp.viewer --port 8765 --transcripts-dir transcripts
 ```
 
+## 共享终端与人工接管
+
+单个 session 页面现在不只是只读 transcript，也可以在浏览器底部输入内容并发送到同一个远端 PTY。浏览器输入默认使用 `actor=human`，MCP 工具默认使用 `actor=agent`，`search_logs` 这类内部能力默认使用 `actor=tool`。所有 `send`、tracked command 和锁事件都会把 actor 写入 transcript，便于回看是谁在什么时候接管了终端。
+
+输入锁用于避免 Agent 和人工同时向同一个 PTY 写入，规则如下：
+
+- 无锁或锁已过期时，新的 actor 可以获取输入锁。
+- 同一个 actor 再次输入会刷新 TTL。
+- 其他 actor 输入会被拒绝，并写入 `input_lock_denied`。
+- `force=true` 可以强制接管，写入 `input_lock_takeover`。
+- viewer 的 `Observer` 模式只旁观，不发送输入，也不会获取锁。
+
+浏览器接口：
+
+- `POST /api/sessions/<session_id>/input`：发送 `{ "text": "...", "enter": true, "actor": "human" }`。
+- `POST /api/sessions/<session_id>/lock`：获取或强制接管输入锁。
+- `POST /api/sessions/<session_id>/unlock`：释放输入锁。
+
+历史 transcript 页面仍然只能查看；只有当前 MCP Server 进程里的活跃 session 可以输入。
+
 ## 长命令与后台轮询
 
 `execute_command` 默认会为命令生成 `command_id` 和完成 marker。命令在 `timeout` 内结束时，返回 `status=completed`、`exit_code` 和输出；命令超过 `timeout` 时，返回 `status=running`、`timed_out=true` 和 `command_id`，reader 线程会继续读取远端输出并写入 transcript。
@@ -203,7 +226,7 @@ runtime/
 
 ```json
 {"dir":"session_meta","session_id":"lab-...","owner_label":"payment-log-check","server_instance_id":"ssh-mcp-..."}
-{"dir":"send","tool":"send_text","text":"2\n"}
+{"dir":"send","tool":"send_text","actor":"human","text":"2\n"}
 {"dir":"recv","text":"Logged in to master...\n"}
 {"dir":"session_health","health_status":"unhealthy","health_error":"SSH transport is inactive"}
 ```

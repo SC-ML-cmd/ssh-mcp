@@ -29,11 +29,11 @@ def open_session(
     passphrase: str | None = None,
     owner_label: str | None = None,
 ) -> dict[str, Any]:
-    """Open a persistent interactive SSH session from a named profile."""
+    """Open a persistent interactive SSH session. Always show display_to_user/viewer_url in the final reply."""
     try:
         ssh_profile = load_profile(profile, config_path)
         session = registry.open(ssh_profile, password=password, passphrase=passphrase, owner_label=owner_label)
-        return {"ok": True, "session": session.info(), "viewer_url": session.viewer_url}
+        return {"ok": True, "session": session.info(), **_viewer_display_payload(session.viewer_url)}
     except Exception as exc:
         LOGGER.exception("open_session failed")
         return {"ok": False, "error": str(exc)}
@@ -87,8 +87,10 @@ def diagnose_profile(profile: str, config_path: str | None = None) -> dict[str, 
 
 @mcp.tool()
 def list_sessions() -> dict[str, Any]:
-    """List active sessions owned by this MCP process."""
-    return {"ok": True, "server": registry.server_info(), "sessions": registry.list()}
+    """List active sessions. Always show display_to_user/viewer URLs when present."""
+    server = registry.server_info()
+    sessions = registry.list()
+    return {"ok": True, "server": server, "sessions": sessions, **_viewer_list_display_payload(server, sessions)}
 
 
 @mcp.tool()
@@ -107,7 +109,7 @@ def reopen_session(
     password: str | None = None,
     passphrase: str | None = None,
 ) -> dict[str, Any]:
-    """Open a fresh SSH login using a previous session's profile; does not replay menus or commands."""
+    """Open a fresh SSH login. Always show display_to_user/viewer_url in the final reply."""
     try:
         previous = registry.get(session_id)
         previous_info = previous.info()
@@ -115,7 +117,7 @@ def reopen_session(
         return {
             "ok": True,
             "session": session.info(),
-            "viewer_url": session.viewer_url,
+            **_viewer_display_payload(session.viewer_url),
             "previous_session": previous_info,
             "previous_session_id": previous.id,
             "previous_transcript_path": str(previous.transcript.path),
@@ -397,6 +399,38 @@ def _session_error_response(exc: Exception, session: SshSession | None) -> dict[
     if not session:
         return {"ok": False, "error": str(exc)}
     return {"ok": False, **session.error_info(str(exc))}
+
+
+def _viewer_display_payload(viewer_url: str | None) -> dict[str, Any]:
+    if not viewer_url:
+        return {
+            "viewer_url": None,
+            "must_show_to_user": False,
+            "display_to_user": "Viewer URL is not available because the local viewer has not started.",
+        }
+    return {
+        "viewer_url": viewer_url,
+        "must_show_to_user": True,
+        "display_to_user": f"SSH MCP viewer URL: {viewer_url}",
+        "display_instruction": "Always include display_to_user or viewer_url in the final response to the user.",
+    }
+
+
+def _viewer_list_display_payload(server: dict[str, Any], sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    viewer_base_url = server.get("viewer_base_url")
+    viewer_urls = [session.get("viewer_url") for session in sessions if session.get("viewer_url")]
+    lines: list[str] = []
+    if viewer_base_url:
+        lines.append(f"SSH MCP viewer home: {viewer_base_url}")
+    if viewer_urls:
+        lines.extend(f"SSH MCP session viewer URL: {url}" for url in viewer_urls)
+    return {
+        "viewer_base_url": viewer_base_url,
+        "viewer_urls": viewer_urls,
+        "must_show_to_user": bool(lines),
+        "display_to_user": "\n".join(lines) if lines else "Viewer URL is not available because the local viewer has not started.",
+        "display_instruction": "Always include display_to_user or viewer URLs in the final response to the user.",
+    }
 
 
 def main(argv: list[str] | None = None) -> None:

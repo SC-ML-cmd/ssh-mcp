@@ -570,6 +570,11 @@ class SshSession:
         self._clear_input_lock()
         self.health_status = "closed"
         self.transcript.record("event", "session closed")
+        LOGGER.info(
+            "SSH session closed: %s",
+            self.id,
+            extra={"session_id": self.id, "owner_label": self.owner_label},
+        )
 
     def info(self) -> dict[str, Any]:
         return {
@@ -771,8 +776,10 @@ class SshSession:
         self._mark_active_command_failed(message, status="session_closed")
         if first_record:
             self.transcript.record("session_health", message, extra={"health_status": status, "health_error": message})
+        prefix = "SSH session closed" if status == "closed" else "SSH session unhealthy"
         LOGGER.warning(
-            "SSH session health changed: %s",
+            "%s: %s",
+            prefix,
             message,
             extra={"session_id": self.id, "owner_label": self.owner_label},
         )
@@ -962,11 +969,30 @@ class SessionRegistry:
     def __init__(self, runtime: ServerRuntime | None = None) -> None:
         self._sessions: dict[str, SshSession] = {}
         self._lock = threading.Lock()
-        self.runtime = runtime or build_runtime()
-        self.server_instance_id = self.runtime.server_instance_id
-        self.client_label = self.runtime.client_label
-        self.started_at = self.runtime.started_at
+        self._runtime_lock = threading.Lock()
+        self._runtime = runtime
         self.viewer_base_url: str | None = None
+
+    @property
+    def runtime(self) -> ServerRuntime:
+        if self._runtime is not None:
+            return self._runtime
+        with self._runtime_lock:
+            if self._runtime is None:
+                self._runtime = build_runtime()
+            return self._runtime
+
+    @property
+    def server_instance_id(self) -> str:
+        return self.runtime.server_instance_id
+
+    @property
+    def client_label(self) -> str | None:
+        return self.runtime.client_label
+
+    @property
+    def started_at(self) -> datetime:
+        return self.runtime.started_at
 
     def set_viewer_base_url(self, base_url: str | None) -> None:
         self.viewer_base_url = base_url.rstrip("/") if base_url else None

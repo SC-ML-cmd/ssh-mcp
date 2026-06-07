@@ -141,7 +141,7 @@ MCP Server 启动时会同时启动本地 viewer。默认从 `8765` 附近自动
 - `/api/sessions`：返回 session 列表和 server 元数据。
 - `/api/sessions/<session_id>/events`：长轮询读取 transcript 增量。
 
-`open_session` 会返回准确的 `viewer_url`，不要手动猜 session URL。
+`open_session` 会返回准确的 `viewer_url`，不要手动猜 session URL。工具返回里还会包含 `display_to_user` 和 `must_show_to_user=true`，Agent 最终回复应直接展示这段 URL。如果模型漏报 URL，让它调用 `list_sessions()`，也会返回 viewer 首页和 session 页面 URL。
 
 也可以只启动历史 viewer：
 

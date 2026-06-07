@@ -369,6 +369,30 @@ class InputLockTests(unittest.TestCase):
         self.assertIn("Input lock is held", denied["error"])
         self.assertTrue(released["released"])
 
+    def test_server_list_sessions_includes_display_viewer_url(self) -> None:
+        import ssh_mcp.server as server_module
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = SessionRegistry(_build_test_runtime(temp_dir, server_instance_id="server-viewer-url-test"))
+            registry.set_viewer_base_url("http://127.0.0.1:8765")
+            session = _fake_session(session_id="viewer-url-session")
+            session.viewer_url = registry.session_url(session.id)
+            with registry._lock:
+                registry._sessions[session.id] = session
+            old_registry = server_module.registry
+            server_module.registry = registry
+            try:
+                response = server_module.list_sessions()
+            finally:
+                server_module.registry = old_registry
+                registry.close_all()
+                session._test_temp_dir.cleanup()
+
+        self.assertTrue(response["must_show_to_user"])
+        self.assertEqual(response["viewer_base_url"], "http://127.0.0.1:8765")
+        self.assertIn("http://127.0.0.1:8765/sessions/viewer-url-session", response["display_to_user"])
+        self.assertIn("http://127.0.0.1:8765/sessions/viewer-url-session", response["viewer_urls"])
+
 
 class RuntimeTests(unittest.TestCase):
     def test_runtime_uses_instance_directories_by_default(self) -> None:
@@ -408,6 +432,23 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(runtime.explicit_transcripts_dir)
         self.assertEqual(runtime.log_path, Path(temp_dir) / "custom.log")
         self.assertEqual(runtime.transcripts_dir, Path(temp_dir) / "custom-transcripts")
+
+    def test_session_registry_without_runtime_is_lazy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_runtime = os.environ.get("SSH_MCP_RUNTIME_DIR")
+            old_log = os.environ.pop("SSH_MCP_LOG_PATH", None)
+            old_transcripts = os.environ.pop("SSH_MCP_TRANSCRIPTS_DIR", None)
+            os.environ["SSH_MCP_RUNTIME_DIR"] = temp_dir
+            try:
+                registry = SessionRegistry()
+                self.assertFalse((Path(temp_dir) / "instances").exists())
+
+                runtime = registry.runtime
+                self.assertTrue(runtime.instance_dir.exists())
+            finally:
+                _restore_env("SSH_MCP_RUNTIME_DIR", old_runtime)
+                _restore_env("SSH_MCP_LOG_PATH", old_log)
+                _restore_env("SSH_MCP_TRANSCRIPTS_DIR", old_transcripts)
 
     def test_log_formatter_supplies_default_context_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

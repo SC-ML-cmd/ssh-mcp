@@ -208,7 +208,52 @@ runtime/
 {"dir":"session_health","health_status":"unhealthy","health_error":"SSH transport is inactive"}
 ```
 
-重要：`send_text(..., sensitive=true)` 不会脱敏，`text` 仍按原文写入 transcript。请保护 `runtime/`、`logs/`、`transcripts/` 的文件权限。
+`send_text(..., sensitive=true)` 会把输入内容写成 `[REDACTED]`，不会把原文落入 transcript。transcript 也会对常见 `password=...`、`token=...`、`Bearer ...` 等文本做基础脱敏。请仍然保护 `runtime/`、`logs/`、`transcripts/` 的文件权限。
+
+## 安全策略
+
+每个 profile 可以配置本地安全策略。策略在命令发往远端 SSH channel 前执行；被拒绝的命令会写入 `security_block` transcript 事件，但不会发送到远端。
+
+```json
+{
+  "profiles": {
+    "prod-readonly": {
+      "host": "10.0.0.10",
+      "username": "ops",
+      "security": {
+        "mode": "readonly",
+        "redact_transcripts": true,
+        "transcript_retention_days": 14,
+        "transcript_max_files": 200
+      }
+    },
+    "prod-restricted": {
+      "host": "10.0.0.11",
+      "username": "ops",
+      "security": {
+        "mode": "restricted",
+        "allow_patterns": [
+          "^tail\\s+-n\\s+\\d+\\s+[/\\.\\w-]+$",
+          "^grep\\s+-n\\s+-i\\s+--\\s+.+$"
+        ],
+        "deny_patterns": [
+          "(?i)kubectl\\s+delete"
+        ]
+      }
+    }
+  }
+}
+```
+
+模式说明：
+
+- `unrestricted`：默认模式，保持兼容；只执行显式 `deny_patterns`。
+- `readonly`：只允许常见读取命令，例如 `cat`、`grep`、`find`、`tail`、`ps`、`df`、`kubectl get/logs/describe` 等，并阻止重定向写入和危险命令。
+- `restricted`：必须匹配 `allow_patterns` 才能执行。
+
+内置危险命令规则会拦截高风险操作，例如 `rm -rf`、`shutdown/reboot`、`mkfs/dd/fdisk`、`chmod -R`、`kubectl delete/apply/patch/scale`、`curl | sh` 等。`send_text` 在严格模式下只允许菜单式短输入或符合策略的文本，避免用 raw input 绕过 `execute_command`。
+
+transcript 文件默认尽量使用私有权限：目录 `0700`、文件 `0600`。可用 `transcript_retention_days` 和 `transcript_max_files` 控制历史 transcript 清理。
 
 ## SSH 心跳与断线处理
 

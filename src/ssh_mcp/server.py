@@ -70,6 +70,15 @@ def diagnose_profile(profile: str, config_path: str | None = None) -> dict[str, 
             "passphrase_env": ssh_profile.passphrase_env,
             "passphrase_env_present": bool(passphrase_value),
             "passphrase_env_length": len(passphrase_value) if passphrase_value else 0,
+            "security": {
+                "mode": ssh_profile.security.mode,
+                "allow_patterns": list(ssh_profile.security.allow_patterns),
+                "deny_patterns": list(ssh_profile.security.deny_patterns),
+                "allow_interactive_text": ssh_profile.security.allow_interactive_text,
+                "redact_transcripts": ssh_profile.security.redact_transcripts,
+                "transcript_retention_days": ssh_profile.security.transcript_retention_days,
+                "transcript_max_files": ssh_profile.security.transcript_max_files,
+            },
         }
     except Exception as exc:
         LOGGER.exception("diagnose_profile failed")
@@ -286,7 +295,7 @@ def search_logs(
     )
     try:
         session = registry.get(session_id)
-        result = session.execute_command(command, timeout=timeout)
+        result = session.execute_command(command, timeout=timeout, policy_tool="search_logs")
         return {
             "ok": True,
             "command": command,

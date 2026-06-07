@@ -12,7 +12,13 @@
       "term": "xterm-256color",
       "width": 120,
       "height": 40,
-      "keepalive_interval": 30
+      "keepalive_interval": 30,
+      "security": {
+        "mode": "unrestricted",
+        "redact_transcripts": true,
+        "transcript_retention_days": 14,
+        "transcript_max_files": 200
+      }
     },
     "password-dev": {
       "host": "10.0.0.11",
@@ -20,7 +26,10 @@
       "password_env": "SSH_MCP_PASSWORD",
       "allow_agent": false,
       "look_for_keys": false,
-      "keepalive_interval": 30
+      "keepalive_interval": 30,
+      "security": {
+        "mode": "readonly"
+      }
     }
   }
 }

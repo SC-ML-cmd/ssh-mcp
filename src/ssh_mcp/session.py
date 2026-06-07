@@ -17,6 +17,7 @@ from urllib.parse import quote
 
 from .config import SshProfile
 from .runtime import ServerRuntime, build_runtime
+from .security import SecurityDecision
 from .transcript import TranscriptWriter
 
 
@@ -280,6 +281,8 @@ class SshSession:
         sensitive: bool = False,
         tool: str = "send_text",
     ) -> CommandResult:
+        if tool not in {"cancel_command", "execute_command", "interrupt"}:
+            self._enforce_text_policy(text, tool=tool)
         self._ensure_open()
         payload = text
         if enter and not payload.endswith("\n"):
@@ -301,7 +304,9 @@ class SshSession:
         wait_for: str = "",
         wait_for_prompt: bool = True,
         timeout: float = 30.0,
+        policy_tool: str = "execute_command",
     ) -> CommandResult:
+        self._enforce_command_policy(command, tool=policy_tool)
         if wait_for:
             return self.send_text(command, enter=True, wait_for=wait_for, timeout=timeout, tool="execute_command")
         if not wait_for_prompt:
@@ -431,6 +436,12 @@ class SshSession:
             "transcript_path": str(self.transcript.path),
             "active_command_id": self._active_command_id,
             "commands": self.list_commands(output_limit=0),
+            "security": {
+                "mode": self.profile.security.mode,
+                "redact_transcripts": self.profile.security.redact_transcripts,
+                "transcript_retention_days": self.profile.security.transcript_retention_days,
+                "transcript_max_files": self.profile.security.transcript_max_files,
+            },
         }
 
     def error_info(self, message: str) -> dict[str, Any]:
@@ -543,6 +554,30 @@ class SshSession:
             self.last_activity_at = datetime.now().astimezone()
             self.transcript.record("send", payload, tool=tool, sensitive=sensitive, extra=extra)
         return offset
+
+    def _enforce_command_policy(self, command: str, *, tool: str) -> None:
+        decision = self.profile.security.evaluate_command(command, tool=tool)
+        if not decision.allowed:
+            self._record_security_block("command", command, decision, tool=tool)
+            raise SessionError(f"Security policy blocked {tool}: {decision.reason}")
+
+    def _enforce_text_policy(self, text: str, *, tool: str) -> None:
+        decision = self.profile.security.evaluate_text(text, tool=tool)
+        if not decision.allowed:
+            self._record_security_block("text", text, decision, tool=tool)
+            raise SessionError(f"Security policy blocked {tool}: {decision.reason}")
+
+    def _record_security_block(self, kind: str, text: str, decision: SecurityDecision, *, tool: str) -> None:
+        self.transcript.record(
+            "security_block",
+            f"blocked {kind}",
+            tool=tool,
+            extra={
+                "blocked_kind": kind,
+                "blocked_text": text,
+                "security": decision.as_dict(),
+            },
+        )
 
     def _start_tracked_command(self, command: str) -> TrackedCommand:
         self._ensure_open()
@@ -726,7 +761,13 @@ class SessionRegistry:
         import paramiko
 
         session_id = _make_session_id(profile.name)
-        transcript = TranscriptWriter(session_id, self.runtime.transcripts_dir)
+        transcript = TranscriptWriter(
+            session_id,
+            self.runtime.transcripts_dir,
+            redact=profile.security.redact_transcripts,
+            retention_days=profile.security.transcript_retention_days,
+            max_files=profile.security.transcript_max_files,
+        )
         viewer_url = self.session_url(session_id)
         # 首行元数据用于把 session 和 MCP 实例、LLM 标签、人类用途标签稳定关联起来。
         transcript.record(

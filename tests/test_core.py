@@ -12,8 +12,9 @@ import urllib.request
 from ssh_mcp.config import load_profile, load_profiles
 from ssh_mcp.log_config import configure_logging
 from ssh_mcp.runtime import build_runtime
+from ssh_mcp.security import REDACTED, SecurityPolicy
 from ssh_mcp.session import SessionRegistry, SshSession, TerminalBuffer, _key_classes_for_file, build_log_search_command
-from ssh_mcp.transcript import TranscriptWriter, list_transcript_summaries, read_events, render_terminal_delta
+from ssh_mcp.transcript import TranscriptWriter, list_transcript_summaries, prune_transcripts, read_events, render_terminal_delta
 from ssh_mcp.viewer import start_viewer_server
 
 
@@ -90,6 +91,34 @@ class ConfigTests(unittest.TestCase):
             finally:
                 os.environ.pop("SSH_MCP_TEST_TEMPLATE", None)
 
+    def test_loads_security_policy_from_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "profiles.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "profiles": {
+                            "readonly": {
+                                "host": "127.0.0.1",
+                                "username": "alice",
+                                "security": {
+                                    "mode": "readonly",
+                                    "transcript_retention_days": 7,
+                                    "transcript_max_files": 20,
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            profile = load_profile("readonly", config_path)
+
+        self.assertEqual(profile.security.mode, "readonly")
+        self.assertEqual(profile.security.transcript_retention_days, 7)
+        self.assertEqual(profile.security.transcript_max_files, 20)
+
 
 class TranscriptTests(unittest.TestCase):
     def test_records_and_tails_events(self) -> None:
@@ -99,10 +128,20 @@ class TranscriptTests(unittest.TestCase):
             writer.record("recv", "ok\n")
             events = writer.tail(10)
 
-        self.assertEqual(events[0]["text"], "password\n")
+        self.assertEqual(events[0]["text"], REDACTED)
         self.assertTrue(events[0]["sensitive"])
+        self.assertTrue(events[0]["redacted"])
         self.assertEqual(events[1]["dir"], "recv")
         self.assertEqual(events[1]["text"], "ok\n")
+
+    def test_redacts_secret_like_text_in_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = TranscriptWriter("session-1", temp_dir)
+            writer.record("send", "token=abc123\n", tool="send_text")
+            events = writer.tail(10)
+
+        self.assertIn(REDACTED, events[0]["text"])
+        self.assertNotIn("abc123", events[0]["text"])
 
     def test_reads_incremental_events_and_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -141,6 +180,20 @@ class TranscriptTests(unittest.TestCase):
         self.assertNotIn("__SSH_MCP_DONE", rendered)
         self.assertNotIn("printf", rendered)
 
+    def test_prunes_transcripts_by_max_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            for index in range(3):
+                path = base / f"session-{index}.jsonl"
+                path.write_text("{}\n", encoding="utf-8")
+                os.utime(path, (100 + index, 100 + index))
+
+            deleted = prune_transcripts(base, max_files=1)
+
+            remaining = sorted(path.name for path in base.glob("*.jsonl"))
+        self.assertEqual(len(deleted), 2)
+        self.assertEqual(remaining, ["session-2.jsonl"])
+
 
 class BufferTests(unittest.TestCase):
     def test_text_since_uses_absolute_offsets(self) -> None:
@@ -166,6 +219,65 @@ class SearchCommandTests(unittest.TestCase):
         self.assertIn("find /tmp/logs -type f -name '*.log'", command)
         self.assertIn("'error: nope'", command)
         self.assertIn("-C 2", command)
+
+
+class SecurityPolicyTests(unittest.TestCase):
+    def test_readonly_policy_allows_read_commands_and_blocks_dangerous_commands(self) -> None:
+        from ssh_mcp.config import SshProfile
+
+        profile = SshProfile(name="readonly", host="127.0.0.1", username="fake", security=SecurityPolicy(mode="readonly"))
+        session = _fake_session(profile=profile)
+        try:
+            allowed = session.execute_command("grep -n timeout app.log", timeout=0.01)
+            with self.assertRaisesRegex(Exception, "Security policy blocked"):
+                session.execute_command("rm -rf /tmp/app", timeout=0.01)
+            events = session.transcript.tail(20)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(allowed.status, "running")
+        self.assertTrue(any(event["dir"] == "security_block" and "rm -rf" in event["blocked_text"] for event in events))
+
+    def test_restricted_policy_requires_allow_pattern(self) -> None:
+        from ssh_mcp.config import SshProfile
+
+        policy = SecurityPolicy(mode="restricted", allow_patterns=(r"^tail\s+-n\s+\d+\s+[/.\w-]+$",))
+        profile = SshProfile(name="restricted", host="127.0.0.1", username="fake", security=policy)
+        session = _fake_session(profile=profile)
+        try:
+            allowed = session.execute_command("tail -n 20 app.log", timeout=0.01)
+            with self.assertRaisesRegex(Exception, "requires an allow pattern"):
+                session.execute_command("cat app.log", timeout=0.01)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(allowed.status, "running")
+
+    def test_send_text_blocks_dangerous_text_before_remote_send(self) -> None:
+        from ssh_mcp.config import SshProfile
+
+        profile = SshProfile(name="readonly", host="127.0.0.1", username="fake", security=SecurityPolicy(mode="readonly"))
+        session = _fake_session(profile=profile)
+        try:
+            with self.assertRaisesRegex(Exception, "Security policy blocked"):
+                session.send_text("rm -rf /tmp/app")
+            sent_payloads = list(session.channel.sent_payloads)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(sent_payloads, [])
+
+    def test_search_logs_is_allowed_in_readonly_mode(self) -> None:
+        from ssh_mcp.config import SshProfile
+
+        profile = SshProfile(name="readonly", host="127.0.0.1", username="fake", security=SecurityPolicy(mode="readonly"))
+        session = _fake_session(profile=profile)
+        try:
+            result = session.execute_command(build_log_search_command("timeout"), timeout=0.01, policy_tool="search_logs")
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(result.status, "running")
 
 
 class RuntimeTests(unittest.TestCase):

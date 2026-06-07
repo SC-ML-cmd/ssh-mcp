@@ -7,7 +7,10 @@ import os
 from pathlib import Path
 import re
 from threading import Lock
+import time
 from typing import Any
+
+from .security import redact_extra, redact_text
 
 
 DEFAULT_TRANSCRIPTS_DIR = Path("transcripts")
@@ -15,14 +18,25 @@ _DONE_MARKER_RE = re.compile(r"^.*__SSH_MCP_DONE_[A-Za-z0-9_-]+__.*(?:\r?\n)?", 
 
 
 class TranscriptWriter:
-    """线程安全地写入 JSONL 审计记录；sensitive 只做标记，不做脱敏。"""
+    """线程安全地写入 JSONL 审计记录，并对敏感输入做本地脱敏。"""
 
-    def __init__(self, session_id: str, base_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        base_dir: str | Path | None = None,
+        *,
+        redact: bool = True,
+        retention_days: int | None = None,
+        max_files: int | None = None,
+    ) -> None:
         self.session_id = session_id
         self.base_dir = Path(base_dir or os.getenv("SSH_MCP_TRANSCRIPTS_DIR") or DEFAULT_TRANSCRIPTS_DIR)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        _chmod_private(self.base_dir, 0o700)
         self.path = self.base_dir / f"{session_id}.jsonl"
+        self.redact = redact
         self._lock = Lock()
+        prune_transcripts(self.base_dir, retention_days=retention_days, max_files=max_files)
 
     def record(
         self,
@@ -33,22 +47,25 @@ class TranscriptWriter:
         sensitive: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> None:
+        visible_text = redact_text(text, force=sensitive) if self.redact else text
         event: dict[str, Any] = {
             "ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
             "session_id": self.session_id,
             "dir": direction,
-            "text": text,
+            "text": visible_text,
         }
         if tool:
             event["tool"] = tool
         if sensitive:
             event["sensitive"] = True
+            if self.redact:
+                event["redacted"] = True
         if extra:
-            event.update(extra)
+            event.update(redact_extra(extra) if self.redact else extra)
 
         line = json.dumps(event, ensure_ascii=False)
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as handle:
+            with _open_private_append(self.path) as handle:
                 handle.write(line + "\n")
 
     def tail(self, count: int = 200) -> list[dict[str, Any]]:
@@ -72,6 +89,45 @@ class TranscriptWriter:
 
 def get_transcripts_dir(base_dir: str | Path | None = None) -> Path:
     return Path(base_dir or os.getenv("SSH_MCP_TRANSCRIPTS_DIR") or DEFAULT_TRANSCRIPTS_DIR)
+
+
+def prune_transcripts(
+    base_dir: str | Path | None = None,
+    *,
+    retention_days: int | None = None,
+    max_files: int | None = None,
+) -> list[Path]:
+    transcripts_dir = get_transcripts_dir(base_dir)
+    if not transcripts_dir.exists():
+        return []
+
+    deleted: list[Path] = []
+    files = sorted(
+        [path for path in transcripts_dir.glob("*.jsonl") if path.is_file()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    if retention_days is not None and retention_days >= 0:
+        cutoff = time.time() - (retention_days * 86400)
+        for path in list(files):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    deleted.append(path)
+                    files.remove(path)
+            except OSError:
+                continue
+
+    if max_files is not None and max_files >= 0:
+        for path in files[max_files:]:
+            try:
+                path.unlink()
+                deleted.append(path)
+            except OSError:
+                continue
+
+    return deleted
 
 
 def read_events(path: str | Path, *, after_line: int = 0, limit: int = 1000) -> tuple[list[dict[str, Any]], int]:
@@ -195,3 +251,20 @@ def _starts_with_terminal_echo(recv_text: str, send_text: str) -> bool:
     normalized_recv = recv_text.replace("\r\n", "\n").replace("\r", "\n")
     normalized_send = send_text.replace("\r\n", "\n").replace("\r", "\n")
     return normalized_recv.startswith(normalized_send)
+
+
+def _open_private_append(path: Path):
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        _chmod_private(path, 0o600)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _chmod_private(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass

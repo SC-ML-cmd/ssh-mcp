@@ -134,6 +134,7 @@ def send_text(
     session_id: str,
     text: str,
     enter: bool = True,
+    enter_sequence: str | None = None,
     wait_for: str = "",
     timeout: float = 30.0,
     sensitive: bool = False,
@@ -147,6 +148,7 @@ def send_text(
         result = session.send_text(
             text,
             enter=enter,
+            enter_sequence=enter_sequence,
             wait_for=wait_for,
             timeout=timeout,
             sensitive=sensitive,
@@ -171,6 +173,7 @@ def execute_command(
     wait_for_prompt: bool = True,
     timeout: float = 30.0,
     actor: str = "agent",
+    enter_sequence: str | None = None,
     lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
     force: bool = False,
 ) -> dict[str, Any]:
@@ -183,6 +186,7 @@ def execute_command(
             wait_for_prompt=wait_for_prompt,
             timeout=timeout,
             actor=actor,
+            enter_sequence=enter_sequence,
             lock_ttl=lock_ttl,
             force=force,
         )

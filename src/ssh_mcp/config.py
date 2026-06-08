@@ -10,10 +10,32 @@ from .security import SecurityPolicy, security_policy_from_config
 
 
 DEFAULT_CONFIG_PATH = Path("config/profiles.json")
+VALID_ENTER_SEQUENCES = {"lf", "cr", "crlf"}
 
 
 class ConfigError(ValueError):
     """Raised when the SSH MCP configuration is missing or invalid."""
+
+
+def normalize_enter_sequence(value: str | None) -> str:
+    if value is None:
+        return "lf"
+    normalized = value.strip().lower()
+    aliases = {
+        "\\n": "lf",
+        "newline": "lf",
+        "linefeed": "lf",
+        "\\r": "cr",
+        "return": "cr",
+        "carriage_return": "cr",
+        "carriage-return": "cr",
+        "\\r\\n": "crlf",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in VALID_ENTER_SEQUENCES:
+        valid = ", ".join(sorted(VALID_ENTER_SEQUENCES))
+        raise ConfigError(f"enter_sequence must be one of: {valid}.")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -36,6 +58,7 @@ class SshProfile:
     term: str = "xterm-256color"
     width: int = 120
     height: int = 40
+    enter_sequence: str = "lf"
     keepalive_interval: float = 30.0
     security: SecurityPolicy = SecurityPolicy()
 
@@ -110,6 +133,7 @@ def _parse_profile(name: str, data: dict[str, Any]) -> SshProfile:
         term=str(data.get("term", "xterm-256color")),
         width=int(data.get("width", 120)),
         height=int(data.get("height", 40)),
+        enter_sequence=normalize_enter_sequence(_optional_str(data.get("enter_sequence")) or os.getenv("SSH_MCP_ENTER_SEQUENCE")),
         keepalive_interval=float(data.get("keepalive_interval", os.getenv("SSH_MCP_KEEPALIVE_INTERVAL") or 30.0)),
         security=security_policy_from_config(data),
     )

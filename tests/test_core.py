@@ -120,6 +120,52 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(profile.security.transcript_retention_days, 7)
         self.assertEqual(profile.security.transcript_max_files, 20)
 
+    def test_loads_enter_sequence_from_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "profiles.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "profiles": {
+                            "dev": {
+                                "host": "127.0.0.1",
+                                "username": "alice",
+                                "enter_sequence": "cr",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            profile = load_profile("dev", config_path)
+
+        self.assertEqual(profile.enter_sequence, "cr")
+
+    def test_uses_enter_sequence_from_env_when_profile_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "profiles.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "profiles": {
+                            "dev": {
+                                "host": "127.0.0.1",
+                                "username": "alice",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.environ["SSH_MCP_ENTER_SEQUENCE"] = "cr"
+            try:
+                profile = load_profile("dev", config_path)
+            finally:
+                os.environ.pop("SSH_MCP_ENTER_SEQUENCE", None)
+
+        self.assertEqual(profile.enter_sequence, "cr")
+
 
 class TranscriptTests(unittest.TestCase):
     def test_records_and_tails_events(self) -> None:
@@ -313,6 +359,35 @@ class InputLockTests(unittest.TestCase):
         self.assertEqual(send_events[-1]["actor"], "agent")
         self.assertEqual(send_events[-1]["tool"], "send_text")
 
+    def test_send_text_supports_enter_sequence_override(self) -> None:
+        session = _fake_session()
+        try:
+            session.send_text("", actor="agent", enter_sequence="cr")
+            session.send_text("pwd", actor="agent", enter_sequence="crlf")
+            sent_payloads = list(session.channel.sent_payloads)
+            events = session.transcript.tail(20)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(sent_payloads[-2], "\r")
+        self.assertEqual(sent_payloads[-1], "pwd\r\n")
+        send_events = [event for event in events if event["dir"] == "send"]
+        self.assertEqual(send_events[-2]["enter_sequence"], "cr")
+        self.assertEqual(send_events[-1]["enter_sequence"], "crlf")
+
+    def test_send_text_uses_profile_enter_sequence(self) -> None:
+        from ssh_mcp.config import SshProfile
+
+        profile = SshProfile(name="cr-profile", host="127.0.0.1", username="fake", enter_sequence="cr")
+        session = _fake_session(profile=profile)
+        try:
+            session.send_text("", actor="agent")
+            sent_payloads = list(session.channel.sent_payloads)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(sent_payloads[-1], "\r")
+
     def test_expired_input_lock_allows_new_actor(self) -> None:
         session = _fake_session()
         try:
@@ -500,6 +575,10 @@ class ViewerTests(unittest.TestCase):
         self.assertIn('id="observer"', html)
         self.assertIn('id="takeLock"', html)
         self.assertIn('id="forceLock"', html)
+        self.assertIn('id="enterSequence"', html)
+        self.assertIn('value="lf"', html)
+        self.assertIn('value="cr"', html)
+        self.assertIn('value="crlf"', html)
 
     def test_viewer_moves_to_next_port_when_requested_port_is_busy(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -589,7 +668,7 @@ class ViewerTests(unittest.TestCase):
             try:
                 response = _json_post(
                     f"{viewer.base_url}/api/sessions/{session.id}/input",
-                    {"text": "pwd", "enter": True, "actor": "human"},
+                    {"text": "pwd", "enter": True, "enter_sequence": "crlf", "actor": "human"},
                 )
                 events = session.transcript.tail(20)
                 sent_payloads = list(session.channel.sent_payloads)
@@ -599,9 +678,10 @@ class ViewerTests(unittest.TestCase):
                 session._test_temp_dir.cleanup()
 
         self.assertTrue(response["ok"])
-        self.assertEqual(sent_payloads[-1], "pwd\n")
+        self.assertEqual(sent_payloads[-1], "pwd\r\n")
         self.assertEqual(response["input_lock"]["actor"], "human")
         self.assertTrue(any(event["dir"] == "send" and event["actor"] == "human" for event in events))
+        self.assertTrue(any(event["dir"] == "send" and event["enter_sequence"] == "crlf" for event in events))
 
     def test_viewer_lock_endpoint_acquires_and_releases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

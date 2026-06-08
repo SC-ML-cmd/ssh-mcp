@@ -112,6 +112,7 @@ Copy-Item .\config\profiles.example.json .\config\profiles.json
 - `SSH_MCP_CONFIG`
 - `SSH_MCP_RUNTIME_DIR`
 - `SSH_MCP_CLIENT_LABEL`
+- `SSH_MCP_ENTER_SEQUENCE`
 - `SSH_MCP_KEY_PASSPHRASE`
 
 不要让多个 MCP Server 固定写同一个 `logs/ssh_mcp.log` 或 `transcripts/`，否则排查时很难区分不同 LLM 窗口。
@@ -131,6 +132,10 @@ claude
 ```
 
 `SSH_MCP_CLIENT_LABEL` 标记 MCP Server 来源，`owner_label` 标记具体 SSH session 的用途。
+
+### Enter sequence
+
+`send_text(..., enter=True)` 会追加 profile 的 `enter_sequence`，默认是 `lf`。如果目标堡垒机或 PAM 行为需要模拟 Xshell 这类终端客户端按下 Enter 时发送 carriage return，可以在 profile 里配置 `"enter_sequence": "cr"`，设置环境变量 `SSH_MCP_ENTER_SEQUENCE=cr`，也可以在单次调用里传 `enter_sequence="cr"` 覆盖。支持值为 `lf`、`cr`、`crlf`。
 
 ## 浏览器 Viewer
 

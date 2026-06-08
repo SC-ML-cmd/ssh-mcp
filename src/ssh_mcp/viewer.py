@@ -241,6 +241,7 @@ def _make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 result = session.send_text(
                     str(body.get("text") or ""),
                     enter=_bool_value(body.get("enter"), True),
+                    enter_sequence=str(body.get("enter_sequence") or "") or None,
                     timeout=_float_value(body.get("timeout"), 0.2),
                     sensitive=_bool_value(body.get("sensitive"), False),
                     actor=actor,
@@ -615,6 +616,47 @@ def _session_html(session_id: str) -> str:
       cursor: not-allowed;
       opacity: 0.55;
     }}
+    .send-controls {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+    }}
+    .enter-sequence {{
+      display: inline-grid;
+      grid-template-columns: repeat(3, minmax(38px, auto));
+      height: 34px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #05070a;
+    }}
+    .enter-sequence label {{
+      min-width: 38px;
+      height: 32px;
+      color: var(--muted);
+      cursor: pointer;
+      font: 12px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }}
+    .enter-sequence label:not(:last-child) {{
+      border-right: 1px solid var(--line);
+    }}
+    .enter-sequence input {{
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }}
+    .enter-sequence span {{
+      display: grid;
+      place-items: center;
+      width: 100%;
+      height: 100%;
+      padding: 0 8px;
+    }}
+    .enter-sequence input:checked + span {{
+      background: var(--accent);
+      color: #fff;
+    }}
     .toggle {{
       display: inline-flex;
       align-items: center;
@@ -670,8 +712,13 @@ def _session_html(session_id: str) -> str:
       <button id="releaseLock" title="Release input lock">Release</button>
     </span>
     <textarea id="input" spellcheck="false" aria-label="Terminal input"></textarea>
-    <span>
+    <span class="send-controls">
       <label class="toggle"><input id="enter" type="checkbox" checked>Enter</label>
+      <span id="enterSequence" class="enter-sequence" role="radiogroup" aria-label="Enter sequence">
+        <label title="Send line feed"><input type="radio" name="enterSequence" value="lf" checked><span>LF</span></label>
+        <label title="Send carriage return"><input type="radio" name="enterSequence" value="cr"><span>CR</span></label>
+        <label title="Send carriage return and line feed"><input type="radio" name="enterSequence" value="crlf"><span>CRLF</span></label>
+      </span>
       <button id="send" title="Send input">Send</button>
     </span>
     <span id="message"></span>
@@ -690,6 +737,7 @@ def _session_html(session_id: str) -> str:
     const releaseLockButton = document.getElementById("releaseLock");
     const inputNode = document.getElementById("input");
     const enterInput = document.getElementById("enter");
+    const enterSequenceInputs = Array.from(document.querySelectorAll("input[name='enterSequence']"));
     const sendButton = document.getElementById("send");
     const messageNode = document.getElementById("message");
     let afterLine = 0;
@@ -709,6 +757,18 @@ def _session_html(session_id: str) -> str:
       messageNode.style.color = error ? "var(--closed)" : "var(--muted)";
     }}
 
+    function selectedEnterSequence() {{
+      const selected = enterSequenceInputs.find(input => input.checked);
+      return selected ? selected.value : "lf";
+    }}
+
+    function setEnterSequence(value) {{
+      const normalized = ["lf", "cr", "crlf"].includes(value) ? value : "lf";
+      enterSequenceInputs.forEach(input => {{
+        input.checked = input.value === normalized;
+      }});
+    }}
+
     function updateControls(session) {{
       const isOpen = session && session.status === "open" && !session.closed;
       const observing = observerInput.checked;
@@ -721,6 +781,10 @@ def _session_html(session_id: str) -> str:
       }}
       inputNode.disabled = observing || !isOpen;
       sendButton.disabled = observing || !isOpen;
+      enterInput.disabled = observing || !isOpen;
+      enterSequenceInputs.forEach(input => {{
+        input.disabled = observing || !isOpen;
+      }});
       takeLockButton.disabled = observing || !isOpen;
       forceLockButton.disabled = observing || !isOpen;
       releaseLockButton.disabled = observing || !isOpen;
@@ -733,6 +797,9 @@ def _session_html(session_id: str) -> str:
       meta.textContent = [session.session_id, session.profile, session.last_activity_at || session.updated_at].filter(Boolean).join("  ");
       statusNode.textContent = session.status || "history";
       statusNode.className = "status " + (session.status || "history");
+      if (session.enter_sequence && !window.__enterSequenceTouched) {{
+        setEnterSequence(session.enter_sequence);
+      }}
       updateControls(session);
     }}
 
@@ -770,6 +837,7 @@ def _session_html(session_id: str) -> str:
         await postJSON(`/api/sessions/${{encodeURIComponent(SESSION_ID)}}/input`, {{
           text,
           enter: enterInput.checked,
+          enter_sequence: selectedEnterSequence(),
           actor: actor(),
           lock_ttl: 60,
           force: false
@@ -808,6 +876,11 @@ def _session_html(session_id: str) -> str:
     }}
 
     observerInput.addEventListener("change", () => updateControls(currentSession));
+    enterSequenceInputs.forEach(input => {{
+      input.addEventListener("change", () => {{
+        window.__enterSequenceTouched = true;
+      }});
+    }});
     takeLockButton.addEventListener("click", () => lockAction("lock", false));
     forceLockButton.addEventListener("click", () => lockAction("lock", true));
     releaseLockButton.addEventListener("click", () => lockAction("unlock", false));

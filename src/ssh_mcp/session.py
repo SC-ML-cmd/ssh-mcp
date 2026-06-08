@@ -15,7 +15,7 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-from .config import SshProfile
+from .config import SshProfile, normalize_enter_sequence
 from .runtime import ServerRuntime, build_runtime
 from .security import SecurityDecision
 from .transcript import TranscriptWriter
@@ -25,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 MAX_BUFFER_CHARS = 200_000
 MAX_COMMAND_OUTPUT_CHARS = 5_000_000
 DEFAULT_INPUT_LOCK_TTL = 60.0
+ENTER_SUFFIXES = {"lf": "\n", "cr": "\r", "crlf": "\r\n"}
 
 
 class SessionError(RuntimeError):
@@ -307,6 +308,7 @@ class SshSession:
         text: str,
         *,
         enter: bool = True,
+        enter_sequence: str | None = None,
         wait_for: str = "",
         timeout: float = 30.0,
         sensitive: bool = False,
@@ -321,9 +323,16 @@ class SshSession:
         self._ensure_open()
         self._require_input_lock(actor=actor, ttl=lock_ttl, force=force)
         payload = text
-        if enter and not payload.endswith("\n"):
-            payload += "\n"
-        offset = self._send_payload(payload, tool=tool, sensitive=sensitive, actor=actor)
+        normalized_enter_sequence = normalize_enter_sequence(enter_sequence or self.profile.enter_sequence)
+        if enter and not payload.endswith(("\r", "\n")):
+            payload += ENTER_SUFFIXES[normalized_enter_sequence]
+        offset = self._send_payload(
+            payload,
+            tool=tool,
+            sensitive=sensitive,
+            actor=actor,
+            extra={"enter": enter, "enter_sequence": normalized_enter_sequence} if enter else {"enter": enter},
+        )
 
         if wait_for:
             timed_out = not self._wait_for(wait_for, offset, timeout)
@@ -342,6 +351,7 @@ class SshSession:
         timeout: float = 30.0,
         policy_tool: str = "execute_command",
         actor: str = "agent",
+        enter_sequence: str | None = None,
         lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
         force: bool = False,
     ) -> CommandResult:
@@ -355,6 +365,7 @@ class SshSession:
                 timeout=timeout,
                 tool="execute_command",
                 actor=actor,
+                enter_sequence=enter_sequence,
                 lock_ttl=lock_ttl,
                 force=force,
             )
@@ -366,13 +377,14 @@ class SshSession:
                 timeout=timeout,
                 tool="execute_command",
                 actor=actor,
+                enter_sequence=enter_sequence,
                 lock_ttl=lock_ttl,
                 force=force,
             )
 
         self._ensure_open()
         self._require_input_lock(actor=actor, ttl=lock_ttl, force=force)
-        tracked = self._start_tracked_command(command, actor=actor)
+        tracked = self._start_tracked_command(command, actor=actor, enter_sequence=enter_sequence)
         completed = self._wait_for_command(tracked.command_id, timeout)
         info = tracked.info()
         timed_out = not completed and info["status"] in {"running", "cancel_requested"}
@@ -583,6 +595,7 @@ class SshSession:
             "host": self.profile.host,
             "port": self.profile.port,
             "username": self.profile.username,
+            "enter_sequence": self.profile.enter_sequence,
             "owner_label": self.owner_label,
             "server_instance_id": self.server_instance_id,
             "viewer_url": self.viewer_url,
@@ -827,8 +840,15 @@ class SshSession:
             },
         )
 
-    def _start_tracked_command(self, command: str, *, actor: str) -> TrackedCommand:
+    def _start_tracked_command(
+        self,
+        command: str,
+        *,
+        actor: str,
+        enter_sequence: str | None = None,
+    ) -> TrackedCommand:
         self._ensure_open()
+        normalized_enter_sequence = normalize_enter_sequence(enter_sequence or self.profile.enter_sequence)
         with self._command_lock:
             if self._active_command_id:
                 active = self._commands.get(self._active_command_id)
@@ -855,11 +875,16 @@ class SshSession:
         wrapped = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\""
         try:
             self._send_payload(
-                wrapped + "\n",
+                wrapped + ENTER_SUFFIXES[normalized_enter_sequence],
                 tool="execute_command",
                 sensitive=False,
                 actor=actor,
-                extra={"command_id": command_id, "command_marker": marker},
+                extra={
+                    "command_id": command_id,
+                    "command_marker": marker,
+                    "enter": True,
+                    "enter_sequence": normalized_enter_sequence,
+                },
             )
         except Exception:
             with self._command_lock:

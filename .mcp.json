@@ -7,6 +7,7 @@
         "SSH_MCP_CONFIG": "${SSH_MCP_PROJECT:-D:/dev/workspace/AI/ssh-mcp}/config/profiles.json",
         "SSH_MCP_RUNTIME_DIR": "${SSH_MCP_PROJECT:-D:/dev/workspace/AI/ssh-mcp}/runtime",
         "SSH_MCP_CLIENT_LABEL": "${SSH_MCP_CLIENT_LABEL}",
+        "SSH_MCP_ENTER_SEQUENCE": "${SSH_MCP_ENTER_SEQUENCE:-lf}",
         "SSH_MCP_KEY_PASSPHRASE": "${SSH_MCP_KEY_PASSPHRASE}"
       },
       "timeout": 600000

@@ -572,6 +572,14 @@ class ViewerTests(unittest.TestCase):
                 viewer.shutdown()
 
         self.assertIn('id="input"', html)
+        self.assertIn('function focusInput()', html)
+        self.assertIn('wasInputDisabled && !inputNode.disabled', html)
+        self.assertIn('terminal.classList.toggle("cursor-active"', html)
+        self.assertIn('@keyframes terminal-cursor-blink', html)
+        self.assertIn('function beginResponseWait()', html)
+        self.assertIn('The SSH channel may be stale', html)
+        self.assertIn('id="reconnect"', html)
+        self.assertIn('function reopenSession()', html)
         self.assertIn('id="observer"', html)
         self.assertIn('id="takeLock"', html)
         self.assertIn('id="forceLock"', html)
@@ -668,7 +676,13 @@ class ViewerTests(unittest.TestCase):
             try:
                 response = _json_post(
                     f"{viewer.base_url}/api/sessions/{session.id}/input",
-                    {"text": "pwd", "enter": True, "enter_sequence": "crlf", "actor": "human"},
+                    {
+                        "text": "pwd",
+                        "enter": True,
+                        "enter_sequence": "crlf",
+                        "actor": "human",
+                        "expect_response": False,
+                    },
                 )
                 events = session.transcript.tail(20)
                 sent_payloads = list(session.channel.sent_payloads)
@@ -721,6 +735,57 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(info["health_status"], "healthy")
         self.assertIn("last_heartbeat_at", info)
         self.assertIsNone(info["health_error"])
+
+    def test_active_health_probe_uses_round_trip_channel(self) -> None:
+        session = _fake_session()
+        try:
+            ok = session.check_health_once(active_probe=True)
+            transport = session.client.get_transport()
+        finally:
+            _close_fake_session(session)
+
+        self.assertTrue(ok)
+        self.assertEqual(transport.probe_count, 1)
+
+    def test_active_health_probe_failure_marks_session_unhealthy(self) -> None:
+        session = _fake_session(probe_error=TimeoutError("probe timeout"))
+        try:
+            with self.assertLogs("ssh_mcp.session", level="WARNING"):
+                ok = session.check_health_once(active_probe=True)
+            info = session.info()
+        finally:
+            _close_fake_session(session)
+
+        self.assertFalse(ok)
+        self.assertEqual(info["health_status"], "unhealthy")
+        self.assertIn("probe timeout", info["health_error"])
+
+    def test_unresponsive_session_rejects_more_input(self) -> None:
+        session = _fake_session()
+        try:
+            session.mark_unresponsive("No remote PTY output")
+            info = session.info()
+            with self.assertRaisesRegex(SessionError, "unresponsive"):
+                session.send_text("pwd")
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(info["health_status"], "unresponsive")
+        self.assertFalse(info["closed"])
+
+    def test_remote_output_restores_unresponsive_session(self) -> None:
+        session = _fake_session()
+        try:
+            session.mark_unresponsive("No remote PTY output")
+            session._record_recv_text("late output\n")
+            info = session.info()
+            events = session.transcript.tail(10)
+        finally:
+            _close_fake_session(session)
+
+        self.assertEqual(info["health_status"], "healthy")
+        self.assertIsNone(info["health_error"])
+        self.assertTrue(any(event["text"] == "remote PTY output resumed" for event in events))
 
     def test_health_check_marks_inactive_transport_unhealthy(self) -> None:
         session = _fake_session(transport_active=False)
@@ -975,9 +1040,11 @@ def _build_test_runtime(temp_dir: str, **kwargs):
 
 
 class _FakeTransport:
-    def __init__(self, active: bool = True) -> None:
+    def __init__(self, active: bool = True, probe_error: Exception | None = None) -> None:
         self.active = active
         self.keepalive_interval: int | None = None
+        self.probe_error = probe_error
+        self.probe_count = 0
 
     def is_active(self) -> bool:
         return self.active
@@ -985,10 +1052,33 @@ class _FakeTransport:
     def set_keepalive(self, interval: int) -> None:
         self.keepalive_interval = interval
 
+    def open_session(self, timeout: float | None = None):
+        self.probe_count += 1
+        if self.probe_error:
+            raise self.probe_error
+        return _FakeProbeChannel()
+
+
+class _FakeProbeChannel:
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+
+    def exec_command(self, command: str) -> None:
+        self.command = command
+
+    def exit_status_ready(self) -> bool:
+        return True
+
+    def recv_exit_status(self) -> int:
+        return 0
+
+    def close(self) -> None:
+        pass
+
 
 class _FakeClient:
-    def __init__(self, transport_active: bool = True) -> None:
-        self.transport = _FakeTransport(transport_active)
+    def __init__(self, transport_active: bool = True, probe_error: Exception | None = None) -> None:
+        self.transport = _FakeTransport(transport_active, probe_error)
         self.closed = False
 
     def get_transport(self) -> _FakeTransport:
@@ -1013,6 +1103,9 @@ class _FakeChannel:
         self.sent_payloads.append(payload)
         return len(payload)
 
+    def sendall(self, payload: str) -> None:
+        self.sent_payloads.append(payload)
+
     def close(self) -> None:
         self.closed = True
 
@@ -1025,6 +1118,7 @@ def _fake_session(
     owner_label: str | None = None,
     previous_session_id: str | None = None,
     previous_transcript_path: str | None = None,
+    probe_error: Exception | None = None,
 ):
     from ssh_mcp.config import SshProfile
 
@@ -1033,7 +1127,7 @@ def _fake_session(
     session = SshSession(
         session_id,
         profile,
-        _FakeClient(transport_active),
+        _FakeClient(transport_active, probe_error),
         _FakeChannel(),
         TranscriptWriter(session_id, temp_dir.name),
         owner_label=owner_label,

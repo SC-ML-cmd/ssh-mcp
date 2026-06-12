@@ -8,3 +8,4 @@ transcripts/
 runtime/
 config/profiles.json
 lab/cmsm_simulator/runtime/
+.playwright-mcp/

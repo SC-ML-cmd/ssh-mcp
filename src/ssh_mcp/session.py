@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import socket
 import string
 import threading
 import time
@@ -25,6 +26,7 @@ LOGGER = logging.getLogger(__name__)
 MAX_BUFFER_CHARS = 200_000
 MAX_COMMAND_OUTPUT_CHARS = 5_000_000
 DEFAULT_INPUT_LOCK_TTL = 60.0
+DEFAULT_HEALTH_PROBE_TIMEOUT = 5.0
 ENTER_SUFFIXES = {"lf": "\n", "cr": "\r", "crlf": "\r\n"}
 
 
@@ -280,6 +282,8 @@ class SshSession:
         self.buffer = TerminalBuffer()
         self.created_at = datetime.now().astimezone()
         self.last_activity_at = self.created_at
+        self.last_send_at: datetime | None = None
+        self.last_recv_at: datetime | None = None
         self.health_status = "healthy"
         self.last_heartbeat_at = self.created_at
         self.health_error: str | None = None
@@ -316,6 +320,7 @@ class SshSession:
         actor: str = "agent",
         lock_ttl: float = DEFAULT_INPUT_LOCK_TTL,
         force: bool = False,
+        expect_response: bool = False,
     ) -> CommandResult:
         actor = self._normalize_actor(actor)
         if tool not in {"cancel_command", "execute_command", "interrupt"}:
@@ -339,7 +344,11 @@ class SshSession:
             output = self.buffer.text_since(offset)
             return CommandResult(output=output, exit_code=None, timed_out=timed_out, matched=None if timed_out else wait_for)
 
-        self._wait_until_quiet(min(timeout, 0.5), quiet_for=0.15)
+        if expect_response:
+            if self._wait_for_output(offset, timeout):
+                self._wait_until_quiet(min(timeout, 0.5), quiet_for=0.15)
+        else:
+            self._wait_until_quiet(min(timeout, 0.5), quiet_for=0.15)
         return CommandResult(output=self.buffer.text_since(offset), exit_code=None, timed_out=False, matched=None)
 
     def execute_command(
@@ -603,6 +612,8 @@ class SshSession:
             "previous_transcript_path": self.previous_transcript_path,
             "created_at": self.created_at.isoformat(timespec="milliseconds"),
             "last_activity_at": self.last_activity_at.isoformat(timespec="milliseconds"),
+            "last_send_at": self.last_send_at.isoformat(timespec="milliseconds") if self.last_send_at else None,
+            "last_recv_at": self.last_recv_at.isoformat(timespec="milliseconds") if self.last_recv_at else None,
             "health_status": self.health_status,
             "last_heartbeat_at": self.last_heartbeat_at.isoformat(timespec="milliseconds")
             if self.last_heartbeat_at
@@ -740,11 +751,29 @@ class SshSession:
             if self.health_status == "healthy":
                 self.health_status = "closed"
 
-    def check_health_once(self) -> bool:
+    def mark_unresponsive(self, message: str) -> None:
+        with self._health_lock:
+            if self.closed or self.health_status == "unresponsive":
+                return
+            self.health_status = "unresponsive"
+            self.health_error = message
+            self.last_heartbeat_at = datetime.now().astimezone()
+        self._clear_input_lock()
+        self.transcript.record(
+            "session_health",
+            message,
+            extra={"health_status": "unresponsive", "health_error": message},
+        )
+        LOGGER.warning(
+            "SSH session unresponsive: %s",
+            message,
+            extra={"session_id": self.id, "owner_label": self.owner_label},
+        )
+
+    def check_health_once(self, *, active_probe: bool = False) -> bool:
         if self.closed:
             self._mark_unhealthy("session is closed", status="closed")
             return False
-
         try:
             transport = self.client.get_transport()
             if transport is None:
@@ -756,22 +785,43 @@ class SshSession:
             if getattr(self.channel, "closed", False):
                 self._mark_unhealthy("SSH channel is closed")
                 return False
+            if active_probe:
+                self._probe_transport(transport, timeout=DEFAULT_HEALTH_PROBE_TIMEOUT)
         except Exception as exc:
             self._mark_unhealthy(f"SSH health check failed: {exc}")
             return False
 
         with self._health_lock:
-            self.health_status = "healthy"
-            self.health_error = None
+            unresponsive = self.health_status == "unresponsive"
+            if not unresponsive:
+                self.health_status = "healthy"
+                self.health_error = None
             self.last_heartbeat_at = datetime.now().astimezone()
-        return True
+        return not unresponsive
 
     def _health_loop(self) -> None:
         # health monitor 只探测连接状态，不尝试重连或重放 CMSM/master/pod 路径。
         interval = max(float(self.profile.keepalive_interval or 30.0), 1.0)
         while not self._stop_event.wait(interval):
-            if not self.check_health_once():
+            if not self.check_health_once(active_probe=True) and self.health_status != "unresponsive":
                 return
+
+    def _probe_transport(self, transport: Any, *, timeout: float) -> None:
+        probe = transport.open_session(timeout=timeout)
+        try:
+            probe.settimeout(timeout)
+            probe.exec_command("true")
+            deadline = time.monotonic() + timeout
+            while not probe.exit_status_ready():
+                if not transport.is_active():
+                    raise SessionError("SSH transport became inactive during health probe")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"SSH round-trip probe timed out after {timeout:.1f}s")
+                time.sleep(0.05)
+            if probe.recv_exit_status() != 0:
+                raise SessionError("SSH round-trip probe returned a non-zero status")
+        finally:
+            probe.close()
 
     def _mark_unhealthy(self, message: str, *, status: str = "unhealthy") -> None:
         with self._health_lock:
@@ -809,8 +859,10 @@ class SshSession:
         self._ensure_open()
         offset, _ = self.buffer.snapshot()
         with self._write_lock:
-            self.channel.send(payload)
-            self.last_activity_at = datetime.now().astimezone()
+            self.channel.sendall(payload)
+            now = datetime.now().astimezone()
+            self.last_activity_at = now
+            self.last_send_at = now
             event_extra = {"actor": actor, **(extra or {})}
             self.transcript.record("send", payload, tool=tool, sensitive=sensitive, extra=event_extra)
         return offset
@@ -898,6 +950,16 @@ class SshSession:
 
     def _record_recv_text(self, text: str) -> None:
         self.buffer.append(text)
+        now = datetime.now().astimezone()
+        self.last_activity_at = now
+        self.last_recv_at = now
+        recovered = False
+        with self._health_lock:
+            if self.health_status == "unresponsive":
+                self.health_status = "healthy"
+                self.health_error = None
+                self.last_heartbeat_at = now
+                recovered = True
         extra: dict[str, Any] | None = None
         completed: TrackedCommand | None = None
         with self._command_lock:
@@ -909,6 +971,12 @@ class SshSession:
                     completed = active
                     self._active_command_id = None
         self.transcript.record("recv", text, extra=extra)
+        if recovered:
+            self.transcript.record(
+                "session_health",
+                "remote PTY output resumed",
+                extra={"health_status": "healthy", "health_error": None},
+            )
         if completed:
             self.transcript.record(
                 "command_complete",
@@ -974,10 +1042,24 @@ class SshSession:
                 return
             time.sleep(0.05)
 
+    def _wait_for_output(self, offset: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._raise_if_reader_failed()
+            if self.buffer.text_since(offset):
+                return True
+            if self.closed:
+                return False
+            time.sleep(0.05)
+        return False
+
     def _ensure_open(self) -> None:
         if self.closed:
             detail = f" {self.health_error}" if self.health_error else ""
             raise SessionError(f"Session '{self.id}' is closed.{detail}")
+        if self.health_status == "unresponsive":
+            detail = f" {self.health_error}" if self.health_error else ""
+            raise SessionError(f"Session '{self.id}' is unresponsive.{detail}")
         if not self.check_health_once():
             detail = f" {self.health_error}" if self.health_error else ""
             raise SessionError(f"Session '{self.id}' is closed.{detail}")
@@ -986,6 +1068,26 @@ class SshSession:
     def _raise_if_reader_failed(self) -> None:
         if self.read_error:
             raise SessionError(f"Session '{self.id}' reader failed: {self.read_error}")
+
+
+def _configure_tcp_keepalive(transport: Any, interval: float) -> None:
+    sock = getattr(transport, "sock", None)
+    if sock is None:
+        return
+    idle_seconds = max(int(interval), 10)
+    probe_seconds = max(min(idle_seconds, 30), 5)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle_seconds)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, probe_seconds)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS") and hasattr(sock, "ioctl"):
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle_seconds * 1000, probe_seconds * 1000))
+    except OSError:
+        LOGGER.debug("Unable to configure TCP keepalive", exc_info=True)
 
 
 class SessionRegistry:
@@ -1107,6 +1209,7 @@ class SessionRegistry:
             transport = client.get_transport()
             if transport and profile.keepalive_interval > 0:
                 transport.set_keepalive(int(profile.keepalive_interval))
+                _configure_tcp_keepalive(transport, profile.keepalive_interval)
             channel = client.invoke_shell(term=profile.term, width=profile.width, height=profile.height)
         except Exception:
             client.close()
@@ -1176,6 +1279,7 @@ class SessionRegistry:
                     "new_transcript_path": str(reopened.transcript.path),
                 },
             )
+            previous.close()
             return reopened
         except Exception as exc:
             previous.transcript.record(

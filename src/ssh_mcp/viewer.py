@@ -75,7 +75,9 @@ class ViewerState:
         sessions = list(by_id.values())
         for session in sessions:
             session["viewer_url"] = session.get("viewer_url") or self.registry.session_url(session["session_id"])
-            if session.get("health_status") == "unhealthy":
+            if session.get("health_status") == "unresponsive":
+                session["status"] = "unresponsive"
+            elif session.get("health_status") == "unhealthy":
                 session["status"] = "unhealthy"
             elif session.get("closed"):
                 session["status"] = "closed"
@@ -189,6 +191,8 @@ def _make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
 
                 if action == "input":
                     self._handle_input(session_id, body)
+                elif action == "reopen":
+                    self._handle_reopen(session_id)
                 elif action == "lock":
                     self._handle_lock(session_id, body, acquire=True)
                 elif action == "unlock":
@@ -237,27 +241,50 @@ def _make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             if not session:
                 return
             actor = str(body.get("actor") or "human")
+            enter = _bool_value(body.get("enter"), True)
+            expect_response = enter and _bool_value(body.get("expect_response"), True)
             try:
                 result = session.send_text(
                     str(body.get("text") or ""),
-                    enter=_bool_value(body.get("enter"), True),
+                    enter=enter,
                     enter_sequence=str(body.get("enter_sequence") or "") or None,
-                    timeout=_float_value(body.get("timeout"), 0.2),
+                    timeout=_float_value(body.get("timeout"), 3.0),
                     sensitive=_bool_value(body.get("sensitive"), False),
                     actor=actor,
                     lock_ttl=_float_value(body.get("lock_ttl"), DEFAULT_INPUT_LOCK_TTL),
                     force=_bool_value(body.get("force"), False),
+                    expect_response=expect_response,
                 )
             except SessionError as exc:
+                self._send_json({"ok": False, **session.error_info(str(exc))}, status=HTTPStatus.CONFLICT)
+                return
+            if expect_response and not result.output:
+                session.mark_unresponsive("No remote PTY output was received after interactive input.")
+            self._send_json(
+                {
+                    "ok": True,
+                    **result.as_dict(),
+                    "session": state.session(session_id) or session.info(),
+                    "input_lock": session.input_lock_info(),
+                    "transcript_path": str(session.transcript.path),
+                }
+            )
+
+        def _handle_reopen(self, session_id: str) -> None:
+            session = self._active_session(session_id)
+            if not session:
+                return
+            try:
+                reopened = state.registry.reopen(session_id)
+            except Exception as exc:
                 self._send_json({"ok": False, **session.error_info(str(exc))}, status=HTTPStatus.CONFLICT)
                 return
             self._send_json(
                 {
                     "ok": True,
-                    **result.as_dict(),
-                    "session": session.info(),
-                    "input_lock": session.input_lock_info(),
-                    "transcript_path": str(session.transcript.path),
+                    "session": state.session(reopened.id) or reopened.info(),
+                    "viewer_url": reopened.viewer_url,
+                    "reopen_scope": "ssh-login-only",
                 }
             )
 
@@ -407,7 +434,7 @@ def _index_html() -> str:
     .id { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
     .status { width: max-content; padding: 2px 8px; border-radius: 999px; color: #fff; background: var(--muted); font-size: 12px; }
     .status.open { background: var(--ok); color: #0d1117; }
-    .status.unhealthy { background: var(--warn); color: #0d1117; }
+    .status.unhealthy, .status.unresponsive { background: var(--warn); color: #0d1117; }
     .status.closed { background: var(--closed); }
     .empty { padding: 36px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); text-align: center; }
     @media (max-width: 760px) {
@@ -549,8 +576,10 @@ def _session_html(session_id: str) -> str:
     .meta {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
     .status {{ width: max-content; padding: 2px 8px; border-radius: 999px; color: #fff; background: var(--muted); font-size: 12px; }}
     .status.open {{ background: var(--ok); color: #05070a; }}
-    .status.unhealthy {{ background: var(--warn); color: #05070a; }}
+    .status.unhealthy, .status.unresponsive {{ background: var(--warn); color: #05070a; }}
     .status.closed {{ background: var(--closed); }}
+    .status-actions {{ display: inline-flex; align-items: center; gap: 8px; }}
+    #reconnect {{ height: 28px; }}
     #terminal {{
       margin: 0;
       width: 100%;
@@ -563,6 +592,26 @@ def _session_html(session_id: str) -> str:
       white-space: pre-wrap;
       word-break: break-word;
       tab-size: 4;
+    }}
+    #terminal.cursor-active::after {{
+      content: "";
+      display: inline-block;
+      width: 0.62em;
+      height: 1.08em;
+      margin-left: 1px;
+      background: currentColor;
+      vertical-align: -0.18em;
+      animation: terminal-cursor-blink 1.05s steps(1, end) infinite;
+    }}
+    @keyframes terminal-cursor-blink {{
+      0%, 48% {{ opacity: 1; }}
+      49%, 100% {{ opacity: 0; }}
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+      #terminal.cursor-active::after {{
+        animation: none;
+        opacity: 0.8;
+      }}
     }}
     footer {{
       display: grid;
@@ -699,7 +748,10 @@ def _session_html(session_id: str) -> str:
       <h1 id="title">{session_id}</h1>
       <span id="meta" class="meta"></span>
     </span>
-    <span id="status" class="status">history</span>
+    <span class="status-actions">
+      <button id="reconnect" title="Open a fresh SSH login" hidden>Reconnect</button>
+      <span id="status" class="status">history</span>
+    </span>
   </header>
   <pre id="terminal"></pre>
   <footer>
@@ -711,7 +763,7 @@ def _session_html(session_id: str) -> str:
       <button id="forceLock" title="Force takeover">Force</button>
       <button id="releaseLock" title="Release input lock">Release</button>
     </span>
-    <textarea id="input" spellcheck="false" aria-label="Terminal input"></textarea>
+    <textarea id="input" spellcheck="false" aria-label="Terminal input" autofocus></textarea>
     <span class="send-controls">
       <label class="toggle"><input id="enter" type="checkbox" checked>Enter</label>
       <span id="enterSequence" class="enter-sequence" role="radiogroup" aria-label="Enter sequence">
@@ -729,6 +781,7 @@ def _session_html(session_id: str) -> str:
     const title = document.getElementById("title");
     const meta = document.getElementById("meta");
     const statusNode = document.getElementById("status");
+    const reconnectButton = document.getElementById("reconnect");
     const actorInput = document.getElementById("actor");
     const observerInput = document.getElementById("observer");
     const lockStatus = document.getElementById("lockStatus");
@@ -741,6 +794,10 @@ def _session_html(session_id: str) -> str:
     const sendButton = document.getElementById("send");
     const messageNode = document.getElementById("message");
     let afterLine = 0;
+    let lastSentText = null;
+    let awaitingRemoteResponse = false;
+    let responseWarningTimer = null;
+    let sendingInput = false;
     let polling = false;
     let currentSession = null;
 
@@ -753,8 +810,38 @@ def _session_html(session_id: str) -> str:
     }}
 
     function setMessage(text, error = false) {{
+      delete messageNode.dataset.kind;
       messageNode.textContent = text || "";
       messageNode.style.color = error ? "var(--closed)" : "var(--muted)";
+    }}
+
+    function beginResponseWait() {{
+      awaitingRemoteResponse = true;
+      clearTimeout(responseWarningTimer);
+      responseWarningTimer = setTimeout(() => {{
+        if (!awaitingRemoteResponse) return;
+        messageNode.dataset.kind = "response-warning";
+        messageNode.textContent = "Input sent, but no remote output. The SSH channel may be stale; reopen the session.";
+        messageNode.style.color = "var(--warn)";
+        if (currentSession) {{
+          currentSession = {{
+            ...currentSession,
+            status: "unresponsive",
+            health_status: "unresponsive",
+            health_error: "No remote PTY output was received after interactive input."
+          }};
+          statusNode.textContent = "unresponsive";
+          statusNode.className = "status unresponsive";
+          updateControls(currentSession);
+        }}
+      }}, 2500);
+    }}
+
+    function clearResponseWait() {{
+      awaitingRemoteResponse = false;
+      clearTimeout(responseWarningTimer);
+      responseWarningTimer = null;
+      if (messageNode.dataset.kind === "response-warning") setMessage("");
     }}
 
     function selectedEnterSequence() {{
@@ -769,25 +856,45 @@ def _session_html(session_id: str) -> str:
       }});
     }}
 
+    function canFocusInput() {{
+      return !inputNode.disabled && currentSession && currentSession.status === "open" && !currentSession.closed;
+    }}
+
+    function focusInput() {{
+      if (!canFocusInput()) return;
+      requestAnimationFrame(() => {{
+        if (!canFocusInput()) return;
+        inputNode.focus({{ preventScroll: true }});
+        const end = inputNode.value.length;
+        inputNode.setSelectionRange(end, end);
+      }});
+    }}
+
     function updateControls(session) {{
       const isOpen = session && session.status === "open" && !session.closed;
+      const canReconnect = session && ["unresponsive", "unhealthy"].includes(session.status);
       const observing = observerInput.checked;
       const lock = session && session.input_lock ? session.input_lock : null;
+      const wasInputDisabled = inputNode.disabled;
       if (lock && lock.locked) {{
         const ttl = Math.max(Math.ceil(lock.ttl_remaining_seconds || 0), 0);
         lockStatus.textContent = `locked:${{lock.actor || "unknown"}} ${{ttl}}s`;
       }} else {{
         lockStatus.textContent = "unlocked";
       }}
-      inputNode.disabled = observing || !isOpen;
-      sendButton.disabled = observing || !isOpen;
-      enterInput.disabled = observing || !isOpen;
+      inputNode.disabled = observing || !isOpen || sendingInput;
+      sendButton.disabled = observing || !isOpen || sendingInput;
+      enterInput.disabled = observing || !isOpen || sendingInput;
       enterSequenceInputs.forEach(input => {{
-        input.disabled = observing || !isOpen;
+        input.disabled = observing || !isOpen || sendingInput;
       }});
       takeLockButton.disabled = observing || !isOpen;
       forceLockButton.disabled = observing || !isOpen;
       releaseLockButton.disabled = observing || !isOpen;
+      terminal.classList.toggle("cursor-active", Boolean(isOpen && !observing));
+      reconnectButton.hidden = !canReconnect;
+      reconnectButton.disabled = !canReconnect;
+      if (wasInputDisabled && !inputNode.disabled) focusInput();
     }}
 
     function updateSession(session) {{
@@ -797,6 +904,11 @@ def _session_html(session_id: str) -> str:
       meta.textContent = [session.session_id, session.profile, session.last_activity_at || session.updated_at].filter(Boolean).join("  ");
       statusNode.textContent = session.status || "history";
       statusNode.className = "status " + (session.status || "history");
+      if (["unresponsive", "unhealthy"].includes(session.status) && session.health_error) {{
+        messageNode.dataset.kind = "health-error";
+        messageNode.textContent = session.health_error + " Use Reconnect to open a fresh SSH login.";
+        messageNode.style.color = "var(--warn)";
+      }}
       if (session.enter_sequence && !window.__enterSequenceTouched) {{
         setEnterSequence(session.enter_sequence);
       }}
@@ -828,11 +940,33 @@ def _session_html(session_id: str) -> str:
       }}
     }}
 
+    function stripEcho(delta, sentText) {{
+      if (!delta || !sentText) return delta;
+      const norm = s => s.replace(/\\r\\n/g, '\\n').replace(/\\r/g, '\\n');
+      const termNorm = norm(terminal.textContent.slice(-300));
+      const termTail = termNorm.replace(/[\\n\\r]+$/, '');
+      const deltaNorm = norm(delta);
+      const sentNorm = norm(sentText);
+      if (termTail.endsWith(sentNorm) && deltaNorm.startsWith(sentNorm)) {{
+        let di = 0, si = 0;
+        while (si < sentText.length && di < delta.length) {{
+          if (delta[di] === '\\r' && sentText[si] !== '\\r') {{ di++; continue; }}
+          if (delta[di] !== sentText[si]) break;
+          di++; si++;
+        }}
+        if (si === sentText.length) return delta.slice(di);
+      }}
+      return delta;
+    }}
+
     async function sendInput() {{
-      if (observerInput.checked || !currentSession || currentSession.status !== "open") return;
+      if (sendingInput || observerInput.checked || !currentSession || currentSession.status !== "open") return;
       const text = inputNode.value;
       if (!text && !enterInput.checked) return;
+      sendingInput = true;
+      updateControls(currentSession);
       setMessage("");
+      beginResponseWait();
       try {{
         await postJSON(`/api/sessions/${{encodeURIComponent(SESSION_ID)}}/input`, {{
           text,
@@ -840,12 +974,30 @@ def _session_html(session_id: str) -> str:
           enter_sequence: selectedEnterSequence(),
           actor: actor(),
           lock_ttl: 60,
-          force: false
+          force: false,
+          expect_response: true
         }});
         inputNode.value = "";
-        inputNode.focus();
+        lastSentText = text;
+      }} catch (error) {{
+        clearResponseWait();
+        setMessage(String(error.message || error), true);
+      }} finally {{
+        sendingInput = false;
+        updateControls(currentSession);
+        focusInput();
+      }}
+    }}
+
+    async function reopenSession() {{
+      reconnectButton.disabled = true;
+      setMessage("Opening a fresh SSH login...");
+      try {{
+        const payload = await postJSON(`/api/sessions/${{encodeURIComponent(SESSION_ID)}}/reopen`, {{}});
+        window.location.assign(payload.viewer_url);
       }} catch (error) {{
         setMessage(String(error.message || error), true);
+        reconnectButton.disabled = false;
       }}
     }}
 
@@ -858,8 +1010,17 @@ def _session_html(session_id: str) -> str:
         if (payload.ok) {{
           const stick = shouldStick();
           afterLine = payload.last_line || afterLine;
+          if ((payload.events || []).some(event => event.dir === "recv")) clearResponseWait();
           if (payload.terminal_delta) {{
-            terminal.textContent += payload.terminal_delta;
+            let delta = payload.terminal_delta;
+            if (lastSentText) {{
+              const stripped = stripEcho(delta, lastSentText);
+              if (stripped !== delta) {{
+                delta = stripped;
+                lastSentText = null;
+              }}
+            }}
+            terminal.textContent += delta;
           }}
           updateSession(payload.session);
           if (stick) terminal.scrollTop = terminal.scrollHeight;
@@ -885,6 +1046,7 @@ def _session_html(session_id: str) -> str:
     forceLockButton.addEventListener("click", () => lockAction("lock", true));
     releaseLockButton.addEventListener("click", () => lockAction("unlock", false));
     sendButton.addEventListener("click", sendInput);
+    reconnectButton.addEventListener("click", reopenSession);
     inputNode.addEventListener("keydown", event => {{
       if (event.key === "Enter" && !event.shiftKey) {{
         event.preventDefault();
